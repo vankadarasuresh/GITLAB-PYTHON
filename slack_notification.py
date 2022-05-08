@@ -8,8 +8,8 @@ import urllib.request
 
 
 def main(CI_COMMIT_TAG, slack_webhook_url):
-    print("Posting Message in SLACK for the passed release")
-    print("Notifying the release")
+   
+#    print("Notifying the release")
 
     webhook_json = {
             
@@ -19,7 +19,7 @@ def main(CI_COMMIT_TAG, slack_webhook_url):
                     "text": {
                         "type": "plain_text",
                         "emoji": True,
-                        "text": f"Current release is : <{CI_COMMIT_TAG}>"
+                        "text": f"Current release : {CI_COMMIT_TAG}"
                     }
                 }
             ]
