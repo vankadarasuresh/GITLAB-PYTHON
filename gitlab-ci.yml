@@ -1,0 +1,3291 @@
+# If you need to temporarily disable a job, prepend it with a period character
+# rather than commenting out multiple lines for cleaner MRs and to better
+# preserve git history. Additional configuration options can be found on
+# https://docs.gitlab.com/ee/ci/yaml/README.html
+
+default:
+  # To update me, replace everything after `sha256:` with the output
+  # from the `rust-ci` x86_64 deploy job on the primary branch and copy the merged
+  # branch's name so its easier to timeline changes if required.
+  # Latest Branch: Rust 1.59 https://gitlab.1password.io/dev/core/rust-ci/-/merge_requests/190
+  image: ${CI_REGISTRY}/dev/core/rust-ci@sha256:68eda4b5fd6c6b4c3f3c557b8bf8941a7b0a2bc3c765fc7de2fc471b0a3b16ba
+  interruptible: true
+  retry:
+    max: 2
+    when:
+      - runner_system_failure
+      - api_failure
+      - scheduler_failure
+      # We don't retry on `runner_unsupported`. We want those failures, so we can fix the runner tag.
+
+### Stages
+stages:
+  - canary
+  - build
+  - scan
+  - pre-package
+  - bvt
+  - sign-packaged-code
+  - package
+  - flatpak
+  - package-verify
+  - sign
+  - sign-verify
+  - publish-prereqs #publish artifacts that later jobs need to be public
+  - publish
+  - report
+  - merge-train
+
+### Variables
+#
+# Global variables which can be accessed by all jobs. Some variables maybe empty
+# if the job isn't running on a protected branch or tag.
+variables:
+  AWS_ACCESS_KEY_ID: ${ONEPASSWORD_AWS_ACCESS_KEY_ID}
+  AWS_SECRET_ACCESS_KEY: ${ONEPASSWORD_AWS_SECRET}
+  # When OP_ALL_TRANSLATION_FILES is set we generate translations
+  OP_ALL_TRANSLATION_FILES: Y
+  CROWDIN_TOKEN: ${CROWDIN_TOKEN}
+  CROWDIN_PROJECT_ID: ${CROWDIN_PROJECT_ID}
+  CROWDIN_VERSION: "3.5.0"
+  GRADLE_USER_HOME: $CI_PROJECT_DIR/.gradle
+  SNAPCRAFT_BUILD_ENVIRONMENT: host
+  GITLAB_MR_ID: $CI_MERGE_REQUEST_ID
+  GIT_SUBMODULE_STRATEGY: recursive
+  RUST_BACKTRACE: "full"
+  RENOVATE_CONFIG_FILE: ./ci/renovate/config.js
+  GITLAB_IGNORE_REPO_URL: "true"
+  RENOVATE_TAG: sha256:8a686bfdbe559f433ffa97dee5f11686c78f893c9437e38026348bb23b5f58c7
+  # This is overwritten by the scheduled scan.
+  FAIL_WHEN_ADVISORY_FOUND: Y,
+  OPA8_UPLOAD_KEYSTORE_ALIAS: upload
+
+
+.B5X_CHROME_BETA_VARIABLES: &B5X_CHROME_BETA_VARIABLES
+  variables:
+    BROWSER: chrome
+    CHANNEL: beta
+
+.B5X_CHROME_STABLE_VARIABLES: &B5X_CHROME_STABLE_VARIABLES
+  variables:
+    BROWSER: chrome
+    CHANNEL: stable
+
+.B5X_FIREFOX_BETA_VARIABLES: &B5X_FIREFOX_BETA_VARIABLES
+  variables:
+    BROWSER: firefox
+    CHANNEL: beta
+
+.B5X_FIREFOX_STABLE_VARIABLES: &B5X_FIREFOX_STABLE_VARIABLES
+  variables:
+    BROWSER: firefox
+    CHANNEL: stable
+
+### Global Cache
+#
+# Creates a unique cache for each CI/CD job. We don't share our cache with pipelines
+# triggered by a tag.
+#
+cache:
+  key: ${CI_JOB_NAME}-${CI_COMMIT_TAG}
+  paths:
+    - .sccache
+
+### Rules
+#
+# Rules are used to define when to run a particular job. Rules are evaluated in order until one matches.
+# https://docs.gitlab.com/ee/ci/yaml/#rules
+.DEFAULT_RULES: &DEFAULT_RULES
+  interruptible: true
+  rules:
+    - if: $CI_MERGE_REQUEST_TITLE =~ /^[Dd]raft:/
+      when: manual
+    - if: $CI_MERGE_REQUEST_ID && $CI_MERGE_REQUEST_EVENT_TYPE != "merge_train"
+    - if: $CI_COMMIT_TAG
+    - if: $CI_COMMIT_BRANCH == "main" && $CI_PIPELINE_SOURCE != "schedule" #nightly builds will be started with the below TEST_RELEASE rule
+    - if: $TEST_RELEASE == "Y"
+    - if: $RUN_LONG_DEV_TASKS == "Y"
+
+.MAIN_RULE: &MAIN_RULE
+  interruptible: true
+  rules:
+    - if: $CI_COMMIT_BRANCH == "main" && $CI_PIPELINE_SOURCE != "schedule"
+
+.MERGE_REQUESTS_RULE: &MERGE_REQUESTS_RULE
+  interruptible: true
+  rules:
+    - if: '$CI_MERGE_REQUEST_ID && $CI_MERGE_REQUEST_EVENT_TYPE != "merge_train" && "ci:full-mr-pipeline" =~ $CI_MERGE_REQUEST_LABELS'
+      variables:
+        NODE_ENV: production
+    - if: $CI_MERGE_REQUEST_TITLE =~ /^[Dd]raft:/
+      when: manual
+    - if: $CI_MERGE_REQUEST_ID && $CI_MERGE_REQUEST_EVENT_TYPE != "merge_train"
+
+.MANUAL_MERGE_REQUESTS_RULE: &MANUAL_MERGE_REQUESTS_RULE
+  interruptible: true
+  rules:
+    - if: '$CI_MERGE_REQUEST_ID && $CI_MERGE_REQUEST_EVENT_TYPE != "merge_train" && "ci:full-mr-pipeline"  =~ $CI_MERGE_REQUEST_LABELS'
+      variables:
+        NODE_ENV: production
+    - if: $CI_MERGE_REQUEST_ID && $CI_MERGE_REQUEST_EVENT_TYPE != "merge_train"
+      when: manual
+      allow_failure: true
+    - if: $RUN_LONG_DEV_TASKS == "Y"
+
+.JS_UI_REVIEW_ENV_BUILD_RULES: &JS_UI_REVIEW_ENV_BUILD_RULES
+  rules:
+    - if: $CI_MERGE_REQUEST_TITLE =~ /^[Dd]raft:/
+      when: manual
+    - if: $CI_MERGE_REQUEST_ID && $CI_MERGE_REQUEST_EVENT_TYPE != "merge_train"
+      changes:
+        - js/ui/**/*
+        - op-ui/**/*
+        - pnpm-lock.yaml
+        - pnpm-workspace.yaml
+        - package.json
+
+.JS_UI_REVIEW_ENV_BUILD_RULES_MANUAL: &JS_UI_REVIEW_ENV_BUILD_RULES_MANUAL
+  rules:
+    - if: $CI_MERGE_REQUEST_TITLE =~ /^[Dd]raft:/
+      when: manual
+    - if: $CI_MERGE_REQUEST_ID && $CI_MERGE_REQUEST_EVENT_TYPE != "merge_train"
+      changes:
+        - js/ui/**/*
+        - op-ui/**/*
+        - pnpm-lock.yaml
+        - pnpm-workspace.yaml
+        - package.json
+      when: manual
+      # Allow merge without needing to run job.
+      allow_failure: true
+
+# Used when building and publishing core-ui and core-types packages for b5web.
+.JS_UI_RELEASE_BUILD_RULES: &JS_UI_RELEASE_BUILD_RULES
+  rules:
+    - if: $CI_COMMIT_BRANCH == "main" && $CI_PIPELINE_SOURCE != "schedule"
+      changes:
+        - js/core-types/package.json
+        - js/ui/dist-package.json
+
+.JS_SAVE_BUTTON_RELEASE_RULES: &JS_SAVE_BUTTON_RELEASE_RULES
+  rules:
+    - if: $CI_COMMIT_TAG =~ /^save-button\/release\/.*$/
+
+# Used for b5web's usage of core-wasm-web
+.JS_CORE_WASM_WEB_RELEASE_RULES: &JS_CORE_WASM_WEB_RELEASE_RULES
+  rules:
+    - if: $CI_COMMIT_TAG =~ /^core-wasm-web\/release\/.*$/
+    - if: $CI_COMMIT_TAG =~ /^ci_automation_test\/.*$/
+
+.JS_CORE_WASM_WEB_PUBLISH_RULES: &JS_CORE_WASM_WEB_PUBLISH_RULES
+  rules:
+    - if: $CI_COMMIT_TAG =~ /^core-wasm-web\/release\/.*$/
+      when: manual
+
+.JS_DEV_BUILD_RULES: &JS_DEV_BUILD_RULES
+  interruptible: true
+  rules:
+    - if: $CI_MERGE_REQUEST_TITLE =~ /^[Dd]raft:/
+      when: manual
+    - if: $CI_MERGE_REQUEST_ID && $CI_MERGE_REQUEST_EVENT_TYPE != "merge_train"
+
+.JS_PROD_BUILD_RULES: &JS_PROD_BUILD_RULES
+  interruptible: true
+  rules:
+    - if: $CI_COMMIT_BRANCH == "main"
+
+.MLX_RELEASE_RULES: &MLX_RELEASE_RULES
+  rules:
+    - if: $CI_COMMIT_TAG =~ /^mlx\/release\/.*$/
+
+.OPH_BUILD_RULES: &OPH_BUILD_RULES
+  interruptible: true
+  rules:
+    - if: $CI_MERGE_REQUEST_TITLE =~ /^[Dd]raft:/
+      when: manual
+    - if: $CI_MERGE_REQUEST_ID && $CI_MERGE_REQUEST_EVENT_TYPE != "merge_train"
+    - if: $CI_COMMIT_TAG =~ /^release\/.*$/
+    - if: $CI_COMMIT_TAG =~ /^oph\/release\/.*$/
+    - if: $CI_COMMIT_TAG =~ /^ci_automation_test\/.*$/
+    - if: $TEST_RELEASE == "Y"
+
+.PACKAGE_RULES: &PACKAGE_RULES
+  interruptible: true
+  rules:
+    - if: '$CI_MERGE_REQUEST_ID && $CI_MERGE_REQUEST_EVENT_TYPE != "merge_train" && "ci:full-mr-pipeline"  =~ $CI_MERGE_REQUEST_LABELS'
+      variables:
+        NODE_ENV: production
+    - if: $CI_MERGE_REQUEST_TITLE =~ /^[Dd]raft:/
+      when: manual
+    - if: $CI_MERGE_REQUEST_ID && $CI_MERGE_REQUEST_EVENT_TYPE != "merge_train"
+      when: manual
+      allow_failure: true
+    - if: $CI_COMMIT_TAG =~ /^release\/.*$/
+    - if: $CI_COMMIT_TAG =~ /^oph\/release\/.*$/
+    - if: $CI_COMMIT_TAG =~ /^ci_automation_test\/.*$/
+    - if: $TEST_RELEASE == "Y"
+
+.OPIO_BUILD_RULES: &OPIO_BUILD_RULES
+  rules:
+    - if: $CI_COMMIT_TAG =~ /^opio\/release\/.*$/
+    - if: $CI_COMMIT_TAG =~ /^ci_automation_test\/.*$/
+    - if: $CI_MERGE_REQUEST_ID && $CI_MERGE_REQUEST_EVENT_TYPE != "merge_train"
+      when: manual
+      allow_failure: true
+
+.OPIO_RELEASE_RULES: &OPIO_RELEASE_RULES
+  rules:
+    - if: $CI_COMMIT_TAG =~ /^opio\/release\/.*$/
+    - if: $CI_COMMIT_TAG =~ /^ci_automation_test\/.*$/
+
+.OPIO_PUBLISH_RULES: &OPIO_PUBLISH_RULES
+  rules:
+    - if: $CI_COMMIT_TAG =~ /^opio\/release\/.*$/
+      when: manual
+
+.OPH_RELEASE_RULES: &OPH_RELEASE_RULES
+  rules:
+    - if: $CI_COMMIT_TAG =~ /^release\/.*$/
+    - if: $CI_COMMIT_TAG =~ /^oph\/release\/.*$/
+    - if: $CI_COMMIT_TAG =~ /^ci_automation_test\/.*$/
+
+.OPH_MANUAL_RELEASE_RULES: &OPH_MANUAL_RELEASE_RULES
+  rules:
+    - if: $CI_COMMIT_TAG =~ /^release\/.*$/
+      when: manual
+    - if: $CI_COMMIT_TAG =~ /^oph\/release\/.*$/
+      when: manual
+    - if: $CI_COMMIT_TAG =~ /^ci_automation_test\/.*$/
+      when: manual
+
+# https://gitlab.1password.io/dev/core/core/-/issues/11352
+# We need to generate the .rpm and .deb repos directly before releasing them
+# We need this to be manaul for stable/beta releases, and automatic on nightlies
+.OPH_OP_CLI_SYNC_RELEASE_RULES: &OPH_OP_CLI_SYNC_RELEASE_RULES
+  rules:
+    - if: $CI_COMMIT_TAG =~ /^release\/nightly.*$/
+    - if: $CI_COMMIT_TAG =~ /^release\/.*$/
+      when: manual
+    - if: $CI_COMMIT_TAG =~ /^oph\/release\/.*$/
+      when: manual
+    - if: $CI_COMMIT_TAG =~ /^ci_automation_test\/.*$/
+      when: manual
+
+.OPH_PUBLISH_RULES: &OPH_PUBLISH_RULES
+  rules:
+    - if: $CI_COMMIT_TAG =~ /^release\/.*$/
+      when: manual
+
+# Same as OPH_PUBLISH_RULES, but will run automatically on nightly builds
+# beta and production remain manual.
+.OPH_PUBLISH_AUTOMATIC_NIGHTLY_RULES: &OPH_PUBLISH_AUTOMATIC_NIGHTLY_RULES
+  rules:
+    - if: $CI_COMMIT_TAG =~ /^release\/nightly.*$/
+    - if: $CI_COMMIT_TAG =~ /^release\/.*$/
+      when: manual
+
+.B5X_BETA_RELEASE_RULES: &B5X_BETA_RELEASE_RULES
+  rules:
+    - if: $CI_COMMIT_TAG =~ /^b5x\/release\/beta\/.*$/
+    - if: $CI_COMMIT_TAG =~ /^b5x\/build\/.*$/
+    - if: $CI_COMMIT_TAG =~ /^ci_automation_test\/.*$/
+
+.B5X_STABLE_RELEASE_RULES: &B5X_STABLE_RELEASE_RULES
+  rules:
+    - if: $CI_COMMIT_TAG =~ /^b5x\/release\/stable\/.*$/
+    - if: $CI_COMMIT_TAG =~ /^ci_automation_test\/.*$/
+
+.B5X_BETA_PUBLISH_RULES: &B5X_BETA_PUBLISH_RULES
+  rules:
+    - if: $CI_COMMIT_TAG =~ /^b5x\/release\/beta\/.*$/
+      when: manual
+
+.B5X_STABLE_PUBLISH_RULES: &B5X_STABLE_PUBLISH_RULES
+  rules:
+    - if: $CI_COMMIT_TAG =~ /^b5x\/release\/stable\/.*$/
+      when: manual
+
+.DEP_REPORT_RULES: &DEP_REPORT_RULES
+  rules:
+    - if: $CI_COMMIT_TAG =~ /^oph\/release\/.*$/
+    - if: $CI_COMMIT_TAG =~ /^b5x\/release\/.*$/
+    - if: $CI_COMMIT_TAG =~ /^opio\/release\/.*$/
+    - if: $CI_COMMIT_TAG =~ /^release\/.*$/
+    # When more releases start to come out of core, add them here.
+
+### Specifications
+#
+# Job specifications contain the jobs scripts and artifacts which then can be
+# optionally shared between multiple jobs.
+
+.LTO_RELEASE: &LTO_RELEASE
+  script:
+    # override the release profile to spend more time making the binary
+    - bash -c 'echo "profile = { release = { lto = true, opt-level = 3, debug-assertions = false, codegen-units = 1 } }" > .cargo/config.toml'
+
+# Used when building and publishing core-ui and core-types packages for b5web.
+.JS_UI_BUILD: &JS_UI_BUILD
+  script:
+    - make -C js ui
+  artifacts:
+    name: "$CI_JOB_NAME-$CI_COMMIT_REF_SLUG"
+    paths:
+      - js/core-types/dist
+      - js/ui/dist
+
+.JS_STORYBOOK_BUILD: &JS_STORYBOOK_BUILD
+  script:
+    - make -C js/ui storybook-deploy
+  artifacts:
+    paths:
+      - js/ui/.storybook-static
+
+.B5X_BUILD: &B5X_BUILD
+  <<: *LTO_RELEASE
+  interruptible: true
+  script:
+    # Bash -c to support using powershell on Windows
+    - bash -c "make -C js b5x"
+    - bash -c "make -C js/b5x/background/mv2 package"
+  artifacts:
+    name: "$CI_JOB_NAME-$CI_COMMIT_REF_SLUG"
+    paths:
+      - js/b5x/background/mv2/dist
+      - js/b5x/changelogs/CHANGELOG
+
+.MLX_BUILD: &MLX_BUILD
+  script:
+    - make -C js mlx
+    - make -C js/mlx release
+  artifacts:
+    paths:
+      - js/mlx/dist/mlx.zip
+
+.OPH_BUILD: &OPH_BUILD
+  <<: *LTO_RELEASE
+  script:
+    # Bash -c to support using powershell on Windows
+    - bash -c "time make test"
+    - bash -c "time make oph"
+  artifacts:
+    when: always
+    paths:
+      - js/oph/dist
+      - foundation/op-sys-info/app.relnum
+      - foundation/op-sys-info/app.buildnum
+      - foundation/op-sys-info/app.version-base
+      - foundation/op-sys-info/app.version-full
+      - foundation/op-sys-info/app.channel
+      - foundation/op-sys-info/app.latest-name
+      - js/oph/package.json
+
+.PACKAGE_STEPS: &PACKAGE_STEPS
+  # Bash -c to support using powershell on Windows
+  - export USE_HARD_LINKS=false
+  - unset CI_PIPELINE_IID
+  - bash -c "make js-bootstrap"
+  - bash -c "make -C js/oph package"
+
+.PACKAGE_ARTIFACTS: &PACKAGE_ARTIFACTS
+  artifacts:
+    expose_as: "packaged_artifacts"
+    when: always
+    paths:
+      - js/oph/dist/
+      - foundation/op-sys-info/app.relnum
+      - foundation/op-sys-info/app.buildnum
+      - foundation/op-sys-info/app.version-base
+      - foundation/op-sys-info/app.version-full
+      - foundation/op-sys-info/app.channel
+      - foundation/op-sys-info/app.latest-name
+      - js/oph/package.json
+    exclude:
+      - js/oph/dist/app/
+      - js/oph/dist/browser-helper.xcarchive/
+      - js/oph/dist/1Password Browser Helper.app/
+      - js/oph/dist/mac
+      - js/oph/dist/mac-arm64
+      - js/oph/dist/mac-universal
+      - js/oph/dist/mas
+      - js/oph/dist/mas-arm64
+      - js/oph/dist/mas-universal
+
+.B5X_BVT: &B5X_BVT
+  interruptible: true
+  image: "$CI_REGISTRY_IMAGE/b5x-bvt"
+  script:
+    - cd js/b5x/bvt
+    - PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1 PLAYWRIGHT_BROWSERS_PATH=/ms-playwright pnpm install
+    - make extension
+    - pnpm bvt
+
+.LINUX_APP_CHANNEL: &LINUX_APP_CHANNEL
+  - APP_CHANNEL=$(cat foundation/op-sys-info/app.channel | tr '[A-Z]' '[a-z]')
+  # stable, candidate, beta, edge are the common channels for linux
+  - |
+    if [[ "${APP_CHANNEL}" == "production" ]]; then
+      export APP_CHANNEL=stable
+    elif [[ "${APP_CHANNEL}" == "beta" ]]; then
+      export APP_CHANNEL=beta
+    elif [[ "${APP_CHANNEL}" == "nightly" ]]; then
+      export APP_CHANNEL=edge
+    else
+      echo "ERROR: unsupported app.channel ${APP_CHANNEL}"
+      exit 1
+    fi
+
+.OPH_SIGN_LINUX: &OPH_SIGN_LINUX
+  image: ${CI_REGISTRY}/ops/infrastructure/infra-ci/aptly:1.4.0-7
+  before_script:
+    # CI runner instance profile has access to the secret
+    - unset AWS_ACCESS_KEY_ID
+    - unset AWS_SECRET_ACCESS_KEY
+    - |
+      aws secretsmanager get-secret-value \
+        --region us-east-2 \
+        --secret-id 'arn:aws:secretsmanager:us-east-2:322190762435:secret:gitlab/1password.io/gldev/op_signer_signing_key' \
+        --output text \
+        --query SecretString \
+      | gpg --batch --import
+  script:
+    # Unlock the gpg key by signing a file in a known location
+    - |
+      aws secretsmanager get-secret-value \
+        --region us-east-2 \
+        --secret-id 'arn:aws:secretsmanager:us-east-2:322190762435:secret:gitlab/1password.io/gldev/op_signer_signing_key_pass' \
+        --output text \
+        --query SecretString \
+      | gpg --pinentry-mode loopback \
+        --passphrase-fd 0 \
+        --batch \
+        --detach-sign \
+        --output /dev/null \
+        /usr/bin/env
+    ######## Tar
+    - gpg --detach-sign --no-armor --default-key 3FEF9748469ADBE15DA7CA80AC2D62742012EA22 js/oph/dist/1password-*.tar.gz
+    ######## RPM
+    - rpmsign --addsign --define "%__gpg /usr/bin/gpg" --define "%_gpg_name 3FEF9748469ADBE15DA7CA80AC2D62742012EA22" js/oph/dist/1password-*.rpm
+    ######## Deb
+    - debsigs --sign=origin --default-key=3FEF9748469ADBE15DA7CA80AC2D62742012EA22 js/oph/dist/1password-*.deb
+    ######## Checksums
+    # Show checksums for future debugging needs and for publishing to AUR
+    - make -C js/oph dist/SHA256SUMS
+  after_script:
+    - gpg --batch --yes --delete-secret-keys 3FEF9748469ADBE15DA7CA80AC2D62742012EA22
+  artifacts:
+    paths:
+      - js/oph/dist
+
+.B5X_PUBLISH: &B5X_PUBLISH
+  script:
+    - export AWS_ACCESS_KEY_ID="${B5X_AWS_ACCESS_KEY_ID}"
+    - export AWS_SECRET_ACCESS_KEY="${B5X_AWS_SECRET_ACCESS_KEY}"
+    - export AWS_DEFAULT_REGION="us-east-1"
+    - eval `ssh-agent -s`
+    - echo "$B5X_SSH_CDN_DIST_B5X_PRIVATE_KEY" | tr -d '\r' | ssh-add - > /dev/null
+    - mkdir -p ~/.ssh && chmod 700 ~/.ssh
+    - echo "$B5X_SSH_CDN_KNOWN_HOSTS" > ~/.ssh/known_hosts && chmod 644 ~/.ssh/known_hosts
+    - make -sC js/b5x/background/mv2 publish
+
+# Signs Windows release's with the code signing cert OPW uses.
+.SIGN_OPIO_WINDOWS: &SIGN_OPIO_WINDOWS
+  script:
+    - cp ./target/release/opio.exe ./opio.exe
+    - $cert = Get-ChildItem -Path cert:\localMachine\my\$OPW_PROD_CERTIFICATE_THUMBPRINT
+    - .\ci\sign-recursive.ps1 -Target ./opio.exe -Cert $cert
+
+.SIGN_OPIO_LINUX: &SIGN_OPIO_LINUX
+  before_script:
+    # CI runner instance profile has access to the secret
+    - unset AWS_ACCESS_KEY_ID
+    - unset AWS_SECRET_ACCESS_KEY
+    - |
+      aws secretsmanager get-secret-value \
+        --region us-east-2 \
+        --secret-id 'arn:aws:secretsmanager:us-east-2:322190762435:secret:gitlab/1password.io/gldev/op_signer_signing_key' \
+        --output text \
+        --query SecretString \
+      | gpg --batch --import
+  script:
+    - |
+      aws secretsmanager get-secret-value \
+        --region us-east-2 \
+        --secret-id 'arn:aws:secretsmanager:us-east-2:322190762435:secret:gitlab/1password.io/gldev/op_signer_signing_key_pass' \
+        --output text \
+        --query SecretString \
+      | gpg --pinentry-mode loopback \
+        --passphrase-fd 0 \
+        --batch \
+        --detach-sign \
+        --output /tmp/warmup.sig \
+        /usr/bin/env
+    - rm /tmp/warmup.sig
+    - cp ./target/release/opio ./opio
+    - gpg --local-user 3FEF9748469ADBE15DA7CA80AC2D62742012EA22 --detach-sign --armor ./opio
+
+### Tags
+#
+# Tags are used to specify which runner should be used to execute the job.
+# The `for-ci` part is to tell the toolchain fetch to use the right URL.
+
+.APPLE_RUNNER_TAG: &APPLE_RUNNER_TAG
+  tags:
+    - apple
+  before_script:
+    - "echo runner tags: $CI_RUNNER_TAGS"
+    # We may need to run `arch -arch $BUILD_ARCH` on some commands to use / not use rosetta.
+    - if [ "$(sysctl -in hw.optional.arm64)" == "1" ]; then BUILD_ARCH="arm64"; else BUILD_ARCH="x86_64"; fi
+    - uname -a
+    - time ./ci/get-install-toolchain js-ci
+    # Cleanup leftover keychain entries
+    - security find-generic-password -l "1Password:MemoryEnclaveKey" && security delete-generic-password -l "1Password:MemoryEnclaveKey" && echo "-l 1Password:MemoryEnclaveKey deleted" || echo "-l 1Password:MemoryEnclaveKey not found"
+    - security find-generic-password -a "1Password:MemoryEnclaveKey" && security delete-generic-password -a "1Password:MemoryEnclaveKey" && echo "-a 1Password:MemoryEnclaveKey deleted" || echo "-a 1Password:MemoryEnclaveKey not found"
+
+.APPLE_X86_64_RUNNER_TAG: &APPLE_X86_64_RUNNER_TAG
+  <<: *APPLE_RUNNER_TAG
+  tags:
+    - apple-x86_64
+
+# Has distribution cert for core apps
+.APPLE_CORE_SIGNER_TAG: &APPLE_CORE_SIGNER_TAG
+  <<: *APPLE_RUNNER_TAG
+  tags:
+    - apple-signer
+
+# Has distribution cert for op. Shared with dev/b5/op
+.APPLE_OPIO_SIGNER_TAG: &APPLE_OPIO_SIGNER_TAG
+  <<: *APPLE_RUNNER_TAG
+  tags:
+    - apple-opio-signer
+
+.APPLE_ARM_RUNNER_TAG: &APPLE_ARM_RUNNER_TAG
+  <<: *APPLE_RUNNER_TAG
+  tags:
+    - apple-arm64
+
+.APPLE_IOS_BUILD_RUNNER_TAG: &APPLE_IOS_BUILD_RUNNER_TAG
+  <<: *APPLE_RUNNER_TAG
+  tags:
+    - iOS-build
+
+.APPLE_IOS_PACKAGE_RUNNER_TAG: &APPLE_IOS_PACKAGE_RUNNER_TAG
+  <<: *APPLE_RUNNER_TAG
+  tags:
+    - iOS-package
+
+.APPLE_BIG_SUR_X86_64_RUNNER_TAG: &APPLE_BIG_SUR_X86_64_RUNNER_TAG
+  tags:
+    - apple-big-sur-x86-64
+
+.LINUX_RUNNER_TAG: &LINUX_RUNNER_TAG
+  tags:
+    - xplatform-rev2
+  before_script:
+    - echo $NODE_ENV
+    - time ./ci/get-install-toolchain "download-only for-ci"
+
+.OP_SIGNER_TAG: &OP_SIGNER_TAG
+  tags:
+    - op-signer
+
+.WINDOWS_DOCKER_RUNNER_TAG: &WINDOWS_DOCKER_RUNNER_TAG
+  # Latest Branch: Rust 1.59 https://gitlab.1password.io/dev/core/rust-ci/-/merge_requests/190
+  image: ${CI_REGISTRY}/dev/core/rust-ci@sha256:98202ced82813f7081694ab98d65f954a65a6678dda4d62618e9570d08f82faf
+  variables:
+    SHELL: /bin/bash -o pipefail
+    OS: Windows_NT
+  tags:
+    - windows-docker
+
+.WINDOWS_SIGNER_TAG: &WINDOWS_SIGNER_TAG
+  tags: ["windows-signer"]
+  # don't run the setup script - we want to install as little as possible on the signing node
+
+.ANDROID_EMULATOR_RUNNER_TAG: &ANDROID_EMULATOR_RUNNER_TAG
+  tags:
+    - apple-android
+  before_script:
+    - time ./ci/get-install-toolchain "android-emulator for-ci"
+    - echo ". $HOME/1password-toolchain-macos/env" > ~/.bash_profile
+    - source ~/.bash_profile
+
+### Job Requirements
+#
+# The `needs:` keyword enables executing jobs out-of-order, allowing you to
+# implement a directed acyclic graph in your .gitlab-ci.yml.
+# https://docs.gitlab.com/ee/ci/yaml/#needs
+# `check-windows` and `check-android` are excluded because they are longer
+.NEEDS_CANARY: &NEEDS_CANARY
+  needs: ["check-linux", "check-apple", "update-version-files"]
+
+### Jobs
+#
+# To keep jobs consistent please use the following order:
+# - Stage
+# - Dependencies
+# - Rules
+# - Runner Tag
+# - Scripts or job specification variable
+# - Artifacts
+
+###
+### Pre
+###
+
+pre-check-b5x-translations:
+  stage: .pre
+  <<: *LINUX_RUNNER_TAG
+  script:
+    - cd js/b5x && ./tools/ensure-all-translations-are-updated.rb
+  allow_failure: true
+  rules:
+    - if: $CI_COMMIT_TAG =~ /^b5x\/release\/(beta|stable)\/.*$/
+
+###
+### Canary
+###
+
+# Update version files on release builds. Files are changed in-place, and are
+# available to jobs that `need: [..., "update-version-files"].
+update-version-files:
+  stage: canary
+  <<: *DEFAULT_RULES
+  <<: *LINUX_RUNNER_TAG
+  script:
+    - ci/update-version-files.sh $CI_COMMIT_TAG
+  artifacts:
+    expose_as: "version_numbers"
+    when: always
+    paths:
+      - foundation/op-sys-info/app.relnum
+      - foundation/op-sys-info/app.buildnum
+      - foundation/op-sys-info/app.version-full
+      - foundation/op-sys-info/app.version-base
+      - foundation/op-sys-info/app.channel
+      - foundation/op-sys-info/app.latest-name
+      - js/oph/package.json
+      - apple/Shared/Supporting/1Password-Version-iOS.xcconfig
+      - apple/Shared/Supporting/1Password-Version-Mac.xcconfig
+      - ci/changelog/opm/CHANGELOG
+      - ci/changelog/opw/CHANGELOG
+
+audit:
+  stage: canary
+  rules:
+    - if: $CI_RUN_AUDIT
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+      changes:
+      - pnpm-lock.yaml
+      - Cargo.lock
+      when: always
+  <<: *LINUX_RUNNER_TAG
+  before_script:
+    - cp .cargo/audit.toml ~/.cargo/
+  script:
+    - python3 ci/vuln-scan-webhook.py js/oph/
+
+# XXX: Remove this job after Core updates to Rust 1.56.1 or later.
+check-dangerous-unicode:
+  stage: canary
+  extends:
+    - .LINUX_RUNNER_TAG
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "schedule" && $CI_CHECK_UNICODE == "Y"'
+  script:
+    # Get the oldest rustc version that has the Unicode denial lints.
+    - rustup install 1.56.1
+    # Run a `cargo check` operation with the Unicode lints. Any compile errors
+    # when running from `main` will most likely be caused by unsafe Unicode sequences being present
+    # as all other errors will be filtered out by the MR CI.
+    - cargo +1.56.1 check
+
+check-electron-version:
+  stage: canary
+  needs: []
+  <<: *LINUX_RUNNER_TAG
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "schedule" && $CI_CHECK_ELECTRON_VERSION == "Y"'
+  script:
+    - python3 ci/check-electron-version.py js/oph/
+
+notify-release:
+  stage: canary
+  needs: []
+  <<: *LINUX_RUNNER_TAG
+  rules:
+    - if: $CI_COMMIT_TAG =~ /^release\/.*$/
+    - if: $CI_COMMIT_TAG =~ /^ci_automation_test\/.*$/
+  script:
+    - python3 ci/notify-release.py
+
+safari-strings-audit:
+  stage: canary
+  rules:
+    - if: $CI_RUN_SAFARI_STRING_AUDIT
+  <<: *LINUX_RUNNER_TAG
+  script:
+    - ci/canary/check-safari-strings.bash js/b5x/background/mv2/src/_locales
+
+check-safari-strings:
+  stage: canary
+  <<: *DEFAULT_RULES
+  <<: *LINUX_RUNNER_TAG
+  script:
+    - ci/canary/check-safari-strings.bash js/b5x/background/mv2/src/_locales
+  allow_failure: true
+
+store-strings-audit:
+  stage: canary
+  rules:
+    - if: $CI_RUN_STORE_STRING_AUDIT
+  <<: *LINUX_RUNNER_TAG
+  script:
+    - ci/canary/check-store-strings.bash
+
+check-store-strings:
+  stage: canary
+  <<: *DEFAULT_RULES
+  <<: *LINUX_RUNNER_TAG
+  script:
+    - ci/canary/check-store-strings.bash
+  allow_failure: true
+
+check-locale-lint:
+  stage: canary
+  rules:
+  <<: *DEFAULT_RULES
+  <<: *LINUX_RUNNER_TAG
+  script:
+    - make js-bootstrap
+    - make check-locale-lint
+
+check-auditor:
+  stage: canary
+  rules:
+  <<: *DEFAULT_RULES
+  <<: *LINUX_RUNNER_TAG
+  script:
+    - make run-auditor
+
+check-b5x-messages:
+  stage: canary
+  <<: *LINUX_RUNNER_TAG
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_EVENT_TYPE != "merge_train"'
+      changes:
+        - js/b5x/background/mv2/**/*
+        - js/b5x/ui/popup/**/*
+  script:
+    - make js-bootstrap
+    - make -C js/b5x/background/mv2 check-messages
+
+udeps:
+  stage: canary
+  rules:
+  <<: *DEFAULT_RULES
+  <<: *LINUX_RUNNER_TAG
+  script:
+    - make udeps
+
+check-release_build:
+  stage: canary
+  rules:
+  <<: *DEFAULT_RULES
+  <<: *LINUX_RUNNER_TAG
+  script:
+    - cargo check --release --all-features
+
+# Ensure `main` will compile after the merge. This is required as `main` may have changed
+# since the CI jobs ran. This job needs to run as fast as possible. DO NOT over load it or
+# we'll be forced to turn merge trains off yet again.
+cargo-check:
+  stage: merge-train
+  needs: []
+  <<: *LINUX_RUNNER_TAG
+  interruptible: true
+  rules:
+    - if: $CI_MERGE_REQUEST_EVENT_TYPE == "merge_train"
+  script:
+    - cargo check --all-features --all-targets
+
+check-linux:
+  stage: canary
+  <<: *DEFAULT_RULES
+  <<: *LINUX_RUNNER_TAG
+  script:
+    - make check-ci
+
+#Can run on Catalina or Big Sur, x86_64 or arm64
+check-apple:
+  stage: canary
+  <<: *DEFAULT_RULES
+  <<: *APPLE_RUNNER_TAG
+  script:
+    - make check-ci
+    - make check-swift
+
+check-js:
+  stage: canary
+  <<: *DEFAULT_RULES
+  <<: *LINUX_RUNNER_TAG
+  script:
+    - make check-js-lint
+    - make -C js js-test
+    - make -C js core-wasm-web
+
+check-android:
+  stage: canary
+  <<: *DEFAULT_RULES
+  <<: *LINUX_RUNNER_TAG
+  script:
+    - make check-android
+    - cd android/app
+    - time ../gradlew --quiet ktlint
+    - cd ../ui-components
+    - time ../gradlew --quiet ktlint
+    - cd ../storybook
+    - time ../gradlew --quiet ktlint
+    - cd ../lint
+    - time ../gradlew --quiet ktlint
+    - cd ..
+    - time ./gradlew lint:test
+    - time ./gradlew --quiet --stacktrace lintDebug -x buildCore
+    - time ./gradlew testDebugUnitTest -x buildCore
+
+check-windows: &CHECK_WINDOWS
+  stage: canary
+  <<: *DEFAULT_RULES
+  <<: *WINDOWS_DOCKER_RUNNER_TAG
+  script:
+    - bash -c "make check-ci"
+
+check-dont-merge:
+  stage: canary
+  extends:
+    - .LINUX_RUNNER_TAG
+  rules:
+    - if: $CI_MERGE_REQUEST_TITLE =~ /^[Dd]raft:/
+      when: manual
+    - if: $CI_MERGE_REQUEST_ID && $CI_MERGE_REQUEST_EVENT_TYPE != "merge_train"
+      allow_failure: true # Don't spam failure notifications while the pipeline is being worked on
+    - if: $CI_MERGE_REQUEST_EVENT_TYPE == "merge_train"
+      allow_failure: false # To be explicit, false is default. During a merge train, failure should stop the merge.
+  script:
+    - ci/canary/check-dont-merge.bash
+
+check-mr-title-will-create-changelog:
+  stage: canary
+  extends:
+    - .LINUX_RUNNER_TAG
+  rules:
+    - if: $CI_MERGE_REQUEST_TITLE =~ /^[Dd]raft:/
+      when: manual
+    - if: $CI_MERGE_REQUEST_ID && $CI_MERGE_REQUEST_EVENT_TYPE != "merge_train"
+      allow_failure: true # Don't spam failure notifications while the pipeline is being worked on
+    - if: $CI_MERGE_REQUEST_EVENT_TYPE == "merge_train"
+      allow_failure: false # To be explicit, false is default. During a merge train, failure should stop the merge.
+  script:
+    - ci/canary/check-mr-title-for-changelog.bash
+
+###
+### build & test
+###
+
+# make oph
+build-mac:
+  stage: build
+  # Ultimately, we plan to have separate builds for updating. For now, we want
+  # the build that is signed and published universal.
+  variables:
+    ELECTRON_BUILDER_ARCH: universal
+  <<: *NEEDS_CANARY
+  <<: *OPH_BUILD_RULES
+  <<: *APPLE_RUNNER_TAG
+  <<: *OPH_BUILD
+
+build-mac_x86:
+  stage: build
+  variables:
+    TARGET_ARCH: x86_64-apple-darwin
+  <<: *NEEDS_CANARY
+  <<: *MANUAL_MERGE_REQUESTS_RULE
+  <<: *APPLE_RUNNER_TAG
+  <<: *OPH_BUILD
+
+build-mac_arm64:
+  stage: build
+  variables:
+    TARGET_ARCH: aarch64-apple-darwin
+  <<: *NEEDS_CANARY
+  <<: *MANUAL_MERGE_REQUESTS_RULE
+  <<: *APPLE_RUNNER_TAG
+  <<: *OPH_BUILD
+
+package-mac-installer-development:
+  stage: package
+  # Ultimately, we plan to have separate builds for updating. For now, we want
+  # the build that is signed and published universal.
+  variables:
+    ELECTRON_BUILDER_ARCH: universal
+  <<: *NEEDS_CANARY
+  <<: *MANUAL_MERGE_REQUESTS_RULE
+  <<: *APPLE_RUNNER_TAG
+  script:
+    - APP_CHANNEL=$(cat foundation/op-sys-info/app.channel)
+    - xcodebuild archive -workspace apple/1Password.xcworkspace -archivePath installer.xcarchive -scheme "1Password Installer" ASSETCATALOG_COMPILER_APPICON_NAME="AppIcon-${APP_CHANNEL}"
+    - xcodebuild -exportArchive -archivePath installer.xcarchive -exportPath installer-artifacts -exportOptionsPlist apple/macOS/build_system/exportOptions/ExportOptions-dev.plist
+  artifacts:
+    when: always
+    paths:
+      - installer-artifacts
+
+package-sign-mac-installer:
+  stage: package
+  # Ultimately, we plan to have separate builds for updating. For now, we want
+  # the build that is signed and published universal.
+  variables:
+    ELECTRON_BUILDER_ARCH: universal
+  <<: *NEEDS_CANARY
+  <<: *OPH_RELEASE_RULES
+  <<: *APPLE_CORE_SIGNER_TAG
+  script:
+    - make -C js/oph unlock-keychain
+    - APP_CHANNEL=$(cat foundation/op-sys-info/app.channel)
+    - xcodebuild archive -workspace apple/1Password.xcworkspace -archivePath installer.xcarchive -scheme "1Password Installer" ASSETCATALOG_COMPILER_APPICON_NAME="AppIcon-${APP_CHANNEL}"
+    - xcodebuild -exportArchive -archivePath installer.xcarchive -exportPath installer-artifacts -exportOptionsPlist apple/macOS/build_system/exportOptions/ExportOptions-Release.plist
+    - ci/package/notarize-installer.bash
+    - mkdir -p ci-dist
+    - cp installer-artifacts/1Password.zip ci-dist/1Password.zip
+  after_script:
+    - security lock-keychain ~/Library/Keychains/service_account.keychain
+    - security lock-keychain ~/Library/Keychains/distribution_signing.keychain
+  artifacts:
+    when: always
+    paths:
+      - installer-artifacts
+      - ci-dist
+  environment:
+    name: sign-opm
+    action: prepare
+
+build-linux-x86:
+  stage: build
+  <<: *NEEDS_CANARY
+  <<: *OPH_BUILD_RULES
+  <<: *LINUX_RUNNER_TAG
+  <<: *OPH_BUILD
+
+build-linux-aarch64:
+  stage: build
+  <<: *NEEDS_CANARY
+  <<: *OPH_BUILD_RULES
+  <<: *LINUX_RUNNER_TAG
+  <<: *LTO_RELEASE
+  before_script:
+    - sudo apt update && sudo apt install -y gcc-aarch64-linux-gnu
+    - rustup target add aarch64-unknown-linux-gnu
+    # Prep to install the one system C library we use, `libudev`.
+    - sudo dpkg --add-architecture arm64
+    - sudo sed -i 's/\deb /&[arch=amd64] /' /etc/apt/sources.list
+    - echo "deb [arch=arm64] http://ports.ubuntu.com/ubuntu-ports bionic main universe" | sudo tee -a /etc/apt/sources.list
+    - echo "deb [arch=arm64] http://ports.ubuntu.com/ubuntu-ports bionic-updates main universe" | sudo tee -a /etc/apt/sources.list
+    # Install the arm64 version of the library.
+    - sudo apt update && sudo apt install -y libudev-dev:arm64
+  script:
+    - export PKG_CONFIG_ALLOW_CROSS="yes"
+    - export TARGET_ARCH="aarch64-unknown-linux-gnu"
+    - bash -c "time make oph"
+  artifacts:
+    when: always
+    paths:
+      - js/oph/dist
+      - foundation/op-sys-info/app.relnum
+      - foundation/op-sys-info/app.buildnum
+      - foundation/op-sys-info/app.version-base
+      - foundation/op-sys-info/app.version-full
+      - foundation/op-sys-info/app.channel
+      - foundation/op-sys-info/app.latest-name
+      - js/oph/package.json
+
+build-windows: &BUILD_WINDOWS
+  stage: build
+  needs: ["check-linux", "check-apple", "check-windows", "update-version-files"]
+  <<: *OPH_BUILD_RULES
+  <<: *WINDOWS_DOCKER_RUNNER_TAG
+  <<: *LTO_RELEASE
+  <<: *OPH_BUILD
+  script:
+    # Bash -c to support using powershell on Windows
+    - bash -c "time make test"
+    - bash -c "time make oph"
+    - bash -c "time make js-bootstrap"
+    - bash -c "time make -C js/oph package"
+  artifacts:
+    when: always
+    paths:
+      - js/oph/dist
+      - 1PasswordSetup.msi
+
+build-iOS:
+  stage: build
+  <<: *NEEDS_CANARY
+  <<: *OPH_BUILD_RULES
+  <<: *LTO_RELEASE
+  <<: *APPLE_IOS_BUILD_RUNNER_TAG
+  script:
+    - make check-ios
+    - time make types-swift
+    - time xcodebuild clean -quiet -workspace apple/1Password.xcworkspace -scheme "iOS" -derivedDataPath ./gitlab_ci_derived_data
+    - time rm -rf ./gitlab_ci_derived_data
+    - time xcrun xctrace list devices | grep "iPhone 11" # [Roo, 2020-02-24] Print out the simulator we're using for testing so we can use it as a data point if we get failing tests.
+    - time xcodebuild test -quiet -workspace apple/1Password.xcworkspace -scheme "iOS" -destination "platform=iOS Simulator,name=iPhone 11,OS=latest" -derivedDataPath ./gitlab_ci_derived_data
+    # save .app for use on simulators
+    - mkdir -p ios_artifacts
+    - pushd gitlab_ci_derived_data/Build/Products/Debug-iphonesimulator/
+    - zip -r 1Password-debug-simulator 1Password.app/
+    - popd
+    - mv gitlab_ci_derived_data/Build/Products/Debug-iphonesimulator/1Password-debug-simulator.zip ios_artifacts/1Password-debug-simulator.zip
+  artifacts:
+    paths:
+      - ios_artifacts/
+      - "gitlab_ci_derived_data"
+    expire_in: 1 week
+    when: always
+
+build-iOS_x86:
+  extends:
+    - build-iOS
+    - .MANUAL_MERGE_REQUESTS_RULE
+  tags:
+    - iOS-build
+    - apple-x86_64
+
+build-iOS_arm64:
+  extends:
+    - build-iOS
+    - .MANUAL_MERGE_REQUESTS_RULE
+  tags:
+    - iOS-build
+    - apple-arm64
+
+build-b5x:
+  stage: build
+  <<: *NEEDS_CANARY
+  <<: *MERGE_REQUESTS_RULE
+  <<: *LINUX_RUNNER_TAG
+  <<: *B5X_BUILD
+
+build-wasm:
+  stage: build
+  <<: *NEEDS_CANARY
+  <<: *MERGE_REQUESTS_RULE
+  <<: *LINUX_RUNNER_TAG
+  <<: *LTO_RELEASE
+  script:
+    - make wasm-test
+
+build-mlx:
+  stage: build
+  <<: *MLX_RELEASE_RULES
+  <<: *LINUX_RUNNER_TAG
+  <<: *MLX_BUILD
+
+build-rustdocs:
+  stage: build
+  <<: *MAIN_RULE
+  <<: *LINUX_RUNNER_TAG
+  script:
+    - make doc
+    - mv target/doc rs
+  artifacts:
+    paths:
+      - rs
+
+build-rustdocs_dev:
+  stage: build
+  <<: *MERGE_REQUESTS_RULE
+  <<: *LINUX_RUNNER_TAG
+  script:
+    - make doc
+    - mv target/doc rs
+  artifacts:
+    expire_in: 1 week
+    paths:
+      - rs
+
+build-core-book:
+  stage: build
+  <<: *MAIN_RULE
+  <<: *LINUX_RUNNER_TAG
+  script:
+    - mdbook build docs/
+    - mv docs/target/book book
+  artifacts:
+    paths:
+      - book
+
+build-core-book_dev:
+  stage: build
+  <<: *NEEDS_CANARY
+  <<: *MERGE_REQUESTS_RULE
+  <<: *LINUX_RUNNER_TAG
+  script:
+    - mdbook build docs/
+  artifacts:
+    expire_in: 1 day
+    paths:
+      - docs/target/book
+
+build-brain-book:
+  stage: build
+  <<: *MAIN_RULE
+  <<: *LINUX_RUNNER_TAG
+  script:
+    - mdbook build op-brain/book
+    - mv op-brain/book/book brain
+  artifacts:
+    paths:
+      - brain
+
+build-brain-book_dev:
+  stage: build
+  <<: *NEEDS_CANARY
+  <<: *MERGE_REQUESTS_RULE
+  <<: *LINUX_RUNNER_TAG
+  script:
+    - mdbook build op-brain/book
+    - mv op-brain/book/book brain
+  artifacts:
+    expire_in: 1 week
+    paths:
+      - brain
+
+build-js_storybook:
+  stage: build
+  <<: *MAIN_RULE
+  <<: *LINUX_RUNNER_TAG
+  <<: *JS_STORYBOOK_BUILD
+
+build-js_storybook_dev:
+  stage: build
+  <<: *JS_UI_REVIEW_ENV_BUILD_RULES
+  <<: *LINUX_RUNNER_TAG
+  <<: *JS_STORYBOOK_BUILD
+
+build-android-native:
+  stage: build
+  needs: ["check-android", "update-version-files"]
+  <<: *PACKAGE_RULES
+  <<: *APPLE_RUNNER_TAG
+  before_script:
+    -  ci/get-install-toolchain android-sdk-ci
+    -  source ~/1password-toolchain-macos/env
+  script:
+    - bash -c "make android"
+  artifacts:
+    # We only need to upload the Core dylib builds, and nothing else.
+    # We're not using expose_as, since that conflicts with wildcards
+    expire_in: 7 days
+    paths:
+      - target/aarch64-linux-android/**/libcore_android.*
+      - target/armv7-linux-androideabi/**/libcore_android.*
+      - target/i686-linux-android/**/libcore_android.*
+      - target/target/x86_64-linux-android/**/libcore_android.*
+
+build-android_x86_32:
+  stage: pre-package
+  needs: ["check-android", "update-version-files"]
+  <<: *OPH_BUILD_RULES
+  <<: *LINUX_RUNNER_TAG
+  <<: *OPH_BUILD
+  script:
+    - export JAVA_HOME=$(readlink -f /usr/bin/java | sed "s:bin/java::")
+    - cd android
+    - time ./gradlew --quiet --stacktrace assembleDebugX86_32 assembleDebugAndroidTest
+  artifacts:
+    expose_as: "android_x86_32"
+    expire_in: 7 days
+    paths:
+      - android/app/build/outputs/apk/
+      - android/app/src/main/java/com/onepassword/android/core/generated
+      - android/ui-components/build/outputs/apk/
+      - android/storybook/build/outputs/apk/
+      - foundation/op-sys-info/app.relnum
+      - foundation/op-sys-info/app.buildnum
+      - foundation/op-sys-info/app.version-base
+      - foundation/op-sys-info/app.version-full
+      - foundation/op-sys-info/app.channel
+      - js/oph/package.json
+
+build-android_x86_64:
+  stage: pre-package
+  needs: ["check-android", "update-version-files"]
+  <<: *OPH_BUILD_RULES
+  <<: *LINUX_RUNNER_TAG
+  script:
+    - export JAVA_HOME=$(readlink -f /usr/bin/java | sed "s:bin/java::")
+    - cd android
+    - time ./gradlew --quiet --stacktrace assembleDebugX86_64
+  artifacts:
+    expose_as: "android_x86_64"
+    expire_in: 7 days
+    paths:
+      - android/app/build/outputs/apk/
+      - android/storybook/build/outputs/apk/
+
+build-android_ARM_32:
+  stage: pre-package
+  needs: ["check-android", "update-version-files"]
+  <<: *OPH_BUILD_RULES
+  <<: *LINUX_RUNNER_TAG
+  script:
+    - export JAVA_HOME=$(readlink -f /usr/bin/java | sed "s:bin/java::")
+    - cd android
+    - time ./gradlew --quiet --stacktrace assembleDebugArm32
+  artifacts:
+    expose_as: "android_ARM_32"
+    expire_in: 7 days
+    paths:
+      - android/app/build/outputs/apk/
+      - android/storybook/build/outputs/apk/
+
+build-android_ARM_64:
+  stage: pre-package
+  needs: ["check-android", "update-version-files"]
+  <<: *OPH_BUILD_RULES
+  <<: *LINUX_RUNNER_TAG
+  script:
+    - export JAVA_HOME=$(readlink -f /usr/bin/java | sed "s:bin/java::")
+    - cd android
+    - time ./gradlew --quiet --stacktrace assembleDebugArm64
+  artifacts:
+    expose_as: "android_ARM_64"
+    expire_in: 7 days
+    paths:
+      - android/app/build/outputs/apk/
+      - android/storybook/build/outputs/apk/
+
+# Used when building and publishing core-ui and core-types packages for b5web.
+build-js_ui:
+  stage: build
+  <<: *JS_UI_RELEASE_BUILD_RULES
+  <<: *LINUX_RUNNER_TAG
+  <<: *JS_UI_BUILD
+
+# Used for b5web's usage of core-wasm-web
+build-js_core-wasm-web:
+  stage: build
+  needs: ["check-js"]
+  <<: *JS_CORE_WASM_WEB_RELEASE_RULES
+  <<: *LINUX_RUNNER_TAG
+  script:
+    - make -C js core-wasm-web
+  artifacts:
+    name: "$CI_JOB_NAME-$CI_COMMIT_REF_SLUG"
+    paths:
+      - ffi/core-wasm-web/dist
+
+build-amo-asset:
+  stage: build
+  <<: *NEEDS_CANARY
+  <<: *LINUX_RUNNER_TAG
+  only:
+    - /^b5x\/release\/(beta|stable)\/.*$/
+  script:
+    #TODO: Move this step back up to root level b5x folder
+    - bash -c "make -C js/b5x/background/mv2 build-amo-asset"
+  artifacts:
+    name: "$CI_JOB_NAME-$CI_COMMIT_REF_SLUG"
+    paths:
+      - dist/1password-review.tar.bz2
+
+build-b5x-chrome-beta:
+  stage: build
+  <<: *NEEDS_CANARY
+  <<: *B5X_CHROME_BETA_VARIABLES
+  <<: *B5X_BUILD
+  <<: *B5X_BETA_RELEASE_RULES
+  <<: *LINUX_RUNNER_TAG
+
+build-b5x-chrome-stable:
+  stage: build
+  <<: *NEEDS_CANARY
+  <<: *B5X_CHROME_STABLE_VARIABLES
+  <<: *B5X_BUILD
+  <<: *B5X_STABLE_RELEASE_RULES
+  <<: *LINUX_RUNNER_TAG
+
+build-b5x-firefox-beta:
+  stage: build
+  <<: *NEEDS_CANARY
+  <<: *B5X_FIREFOX_BETA_VARIABLES
+  <<: *B5X_BUILD
+  <<: *B5X_BETA_RELEASE_RULES
+  <<: *LINUX_RUNNER_TAG
+
+build-b5x-firefox-stable:
+  stage: build
+  <<: *NEEDS_CANARY
+  <<: *B5X_FIREFOX_STABLE_VARIABLES
+  <<: *B5X_BUILD
+  <<: *B5X_STABLE_RELEASE_RULES
+  <<: *LINUX_RUNNER_TAG
+
+#################
+# opio build pipelines
+#################
+
+# Release builds of the app. These are stripped for size reasons and then signed
+# later, for each of the 3 "big platforms".
+
+# Builds the 64-bit version of `opio`.
+build-opio-release_windows_x64: &BUILD_OPIO_RELEASE_WINDOWS_X64
+  stage: build
+  <<: *OPIO_BUILD_RULES
+  <<: *WINDOWS_DOCKER_RUNNER_TAG
+  script:
+    - $env:RUSTFLAGS="-C link-arg=/DEBUG:NONE"
+    - cargo build --target x86_64-pc-windows-msvc --bin opio --release
+  after_script:
+    - cp ./target/x86_64-pc-windows-msvc/release/opio.exe ./target/release/opio.exe
+  artifacts:
+    paths:
+      - ./target/release/opio.exe
+      - ./target/opio.version
+      - ./target/x86_64-pc-windows-msvc/opio.exe
+
+# Builds the 32-bit version of `opio`.
+build-opio-release_windows_x86:
+  stage: build
+  <<: *OPIO_BUILD_RULES
+  <<: *WINDOWS_DOCKER_RUNNER_TAG
+  script:
+    - $env:RUSTFLAGS="-C target-feature=+crt-static -C link-arg=/DEBUG:NONE"
+    - rustup target add i686-pc-windows-msvc
+    - cargo build --target=i686-pc-windows-msvc --bin opio --release
+  after_script:
+    - cp ./target/i686-pc-windows-msvc/release/opio.exe ./target/release/opio.exe
+  artifacts:
+    paths:
+      - ./target/release/opio.exe
+      - ./target/opio.version
+
+# Builds the linux (default) 64-bit version of `opio`.
+build-opio-release_linux_x64:
+  stage: build
+  <<: *OPIO_BUILD_RULES
+  <<: *LINUX_RUNNER_TAG
+  script:
+    - cargo build --bin opio --release
+  artifacts:
+    paths:
+      - ./target/release/opio
+      - ./target/opio.version
+  variables:
+    RUSTFLAGS: "-C link-arg=-s"
+
+# Builds the linux 32-bit version of `opio.
+build-opio-release_linux_x86:
+  stage: build
+  <<: *OPIO_BUILD_RULES
+  <<: *LINUX_RUNNER_TAG
+  # Get the 32-bit toolchain so we can compile a 32 bit binary version
+  # for people who have computers so old, that I don't know how they are using them. But
+  # `op` does it, so we will too.
+  script:
+    - sudo apt update && sudo apt install gcc-multilib -y
+    - rustup target add i686-unknown-linux-gnu
+    # This tells `cargo` to specifically build `op-import-export` and to not look at any other
+    # crates.
+    - cd ./op-import-export
+    - cargo build --target=i686-unknown-linux-gnu --bin opio --release
+    - cd ../
+  after_script:
+    - cp ./target/i686-unknown-linux-gnu/release/opio ./target/release/opio
+  artifacts:
+    paths:
+      - ./target/release/opio
+      - ./target/opio.version
+  variables:
+    RUSTFLAGS: "-C link-arg=-s"
+
+# Builds opio for 64-bit ARM
+build-opio-release_linux_aarch64:
+  stage: build
+  <<: *OPIO_BUILD_RULES
+  <<: *LINUX_RUNNER_TAG
+  before_script:
+    - sudo apt update && sudo apt install -y gcc-aarch64-linux-gnu
+    - rustup target add aarch64-unknown-linux-gnu
+  script:
+    - export RUSTFLAGS="$RUSTFLAGS -C linker=aarch64-linux-gnu-gcc"
+    - cd ./op-import-export
+    - cargo build --bin opio --release --target=aarch64-unknown-linux-gnu
+    - cd ../
+  after_script:
+    - cp ./target/aarch64-unknown-linux-gnu/release/opio ./target/release/opio
+  artifacts:
+    paths:
+      - ./target/release/opio
+      - ./target/opio.version
+  variables:
+    RUSTFLAGS: "-C link-arg=-s"
+
+# Builds opio for 32-bit ARM
+build-opio-release_linux_armv7:
+  stage: build
+  <<: *OPIO_BUILD_RULES
+  <<: *LINUX_RUNNER_TAG
+  before_script:
+    - sudo apt update && sudo apt install gcc-arm-linux-gnueabihf -y
+    - rustup target add armv7-unknown-linux-gnueabihf
+  script:
+    - cd ./op-import-export
+    - export RUSTFLAGS="$RUSTFLAGS -C linker=arm-linux-gnueabihf-gcc"
+    - cargo build --bin opio --release --target=armv7-unknown-linux-gnueabihf
+    - cd ../
+  after_script:
+    - cp ./target/armv7-unknown-linux-gnueabihf/release/opio ./target/release/opio
+  artifacts:
+    paths:
+      - ./target/release/opio
+      - ./target/opio.version
+  variables:
+    RUSTFLAGS: "-C link-arg=-s"
+
+build-opio-release_macos_x64:
+  stage: build
+  <<: *OPIO_BUILD_RULES
+  <<: *APPLE_X86_64_RUNNER_TAG
+  script:
+    - cd ./op-import-export
+    - cargo build --bin opio --release --target=x86_64-apple-darwin
+  after_script:
+    - cp ./target/x86_64-apple-darwin/release/opio ./target/release/opio_x64
+  artifacts:
+    paths:
+      - ./target/release/opio_x64
+      - ./target/opio.version
+  variables:
+    RUSTFLAGS: "-C link-arg=-s"
+
+build-opio-release-macos_arm64:
+  stage: build
+  <<: *OPIO_BUILD_RULES
+  <<: *APPLE_X86_64_RUNNER_TAG
+  script:
+    - cd ./op-import-export
+    - cargo build --bin opio --release --target=aarch64-apple-darwin
+  after_script:
+    - cp ./target/aarch64-apple-darwin/release/opio ./target/release/opio_aarch64
+  artifacts:
+    paths:
+      - ./target/release/opio_aarch64
+  variables:
+    RUSTFLAGS: "-C link-arg=-s"
+
+#################
+# misc tools build pipelines
+#################
+
+# Builds the 64-bit version of `opio`.
+build-pcr-dumper-release_windows:
+  stage: build
+  # Re-use opio's build rules since they do everything we want.
+  <<: *OPIO_BUILD_RULES
+  <<: *WINDOWS_DOCKER_RUNNER_TAG
+  script:
+    - cargo build --target x86_64-pc-windows-msvc --bin pcr_dumper --release
+  after_script:
+    - cp ./target/x86_64-pc-windows-msvc/release/pcr_dumper.exe ./target/release/pcr_dumper.exe
+  artifacts:
+    paths:
+      - ./target/release/pcr_dumper.exe
+
+#################
+# b5x BVTs
+#################
+
+build-bvt-b5x-image:
+  stage: build
+  image: docker:latest
+  services:
+    - docker:dind
+  tags:
+    - xplatform-rev2
+  rules:
+    - if: $CI_COMMIT_BRANCH == "main" && $CI_PIPELINE_SOURCE != "schedule"
+      changes:
+        - js/b5x/bvt/Dockerfile
+  script:
+    - cd js/b5x/bvt
+    - docker login -u "$CI_REGISTRY_USER" -p "$CI_REGISTRY_PASSWORD" $CI_REGISTRY
+    - docker build --pull -t "$CI_REGISTRY_IMAGE/b5x-bvt" .
+    - docker push "$CI_REGISTRY_IMAGE/b5x-bvt"
+
+bvt-b5x:
+  stage: bvt
+  <<: *B5X_BVT
+  tags:
+    - xplatform-rev2
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_EVENT_TYPE != "merge_train"'
+      changes:
+        - js/b5x/bvt/**/*
+  needs: ["build-b5x"]
+
+###
+### scan
+###
+
+verify-windows-dlls: &VERIFY_WINDOWS_DLLS
+  stage: scan
+  needs: ["build-windows"]
+  dependencies: ["build-windows"]
+  <<: *MERGE_REQUESTS_RULE
+  <<: *WINDOWS_DOCKER_RUNNER_TAG
+  # workaround for dev/core/core#10933 - use an older windows image with dumpbin.exe on path
+  image: ${CI_REGISTRY}/dev/core/rust-ci@sha256:6fd0368a8b48186f879e4cfa2922baaaf74575037d05425fcef8fb276c3a9022
+  script:
+    - C:\Python38\python3.exe ./ci/linking-checks/verify_windows_dlls.py
+
+flag-invalid-or-malicious-svg-files:
+  <<: *LINUX_RUNNER_TAG
+  stage: scan
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"' 
+      changes:
+        - "**/*.svg"
+        - "ci/security/flag_malicious_svg.py"
+    - when: never
+  script:
+    - './ci/security/flag_malicious_svg.py .'
+
+
+###
+### bvt
+###
+
+bvt-linux:
+  stage: bvt
+  <<: *NEEDS_CANARY
+  <<: *MERGE_REQUESTS_RULE
+  <<: *LINUX_RUNNER_TAG
+  script:
+    - time make test-online
+  allow_failure: true # mitigation for https://gitlab.1password.io/dev/core/core/-/issues/11894 / https://gitlab.1password.io/dev/b5/b5/-/issues/11053#note_1328029
+
+bvt-windows: &BVT_WINDOWS
+  stage: bvt
+  <<: *NEEDS_CANARY
+  <<: *MERGE_REQUESTS_RULE
+  <<: *WINDOWS_DOCKER_RUNNER_TAG
+  script:
+    - Measure-Command { make test-online | Out-Default }
+    - exit $LASTEXITCODE
+  allow_failure: true
+
+bvt-iOS:
+  stage: bvt
+  <<: *NEEDS_CANARY
+  # change to MERGE_REQUESTS_RULE after https://gitlab.1password.io/dev/core/core/-/issues/14385 bvt-iOS is failing
+  <<: *MANUAL_MERGE_REQUESTS_RULE
+  <<: *APPLE_IOS_BUILD_RUNNER_TAG
+  script:
+    - time make types-swift
+    - time rm -rf ./gitlab_ci_derived_data
+    - time xcrun xctrace list devices | grep "iPhone 11" # [Roo, 2020-02-24] Print out the simulator we're using for testing so we can use it as a data point if we get failing tests.
+    - time xcodebuild test -workspace apple/1Password.xcworkspace -scheme "BVT-iOS" -destination "platform=iOS Simulator,name=iPhone 11,OS=latest" -derivedDataPath ./gitlab_ci_derived_data INCLUDE_BVT=1
+  allow_failure: true
+  artifacts:
+    when: always
+    expire_in: 1 week
+    paths:
+      - gitlab_ci_derived_data/Logs
+
+.BVT_MACOS: &BVT_MACOS
+  stage: bvt
+  dependencies: []
+  <<: *NEEDS_CANARY
+  <<: *MERGE_REQUESTS_RULE
+  script:
+    - time make types-swift
+    - time rm -rf ./gitlab_ci_derived_data
+    - time xcodebuild test -workspace apple/1Password.xcworkspace -scheme "BVT-macOS" -derivedDataPath ./gitlab_ci_derived_data INCLUDE_BVT=1
+  artifacts:
+    when: always
+    expire_in: 1 week
+    paths:
+      - gitlab_ci_derived_data/Logs
+
+bvt-macOS:
+  stage: bvt
+  <<: *BVT_MACOS
+  <<: *APPLE_BIG_SUR_X86_64_RUNNER_TAG
+  allow_failure: true # mitigation for https://gitlab.1password.io/dev/core/core/-/issues/10880
+
+bvt-macOS_ARM:
+  stage: bvt
+  dependencies: []
+  <<: *BVT_MACOS
+  <<: *APPLE_ARM_RUNNER_TAG
+
+bvt-android:
+  stage: bvt
+  needs:
+    - job: build-android_x86_32
+      artifacts: true
+  <<: *MERGE_REQUESTS_RULE
+  <<: *ANDROID_EMULATOR_RUNNER_TAG
+  script:
+    - chmod +x ./android/ci/wait-for-emulator.sh
+    - chmod +x ./android/ci/kill-emulators.sh
+    - chmod +x ./android/ci/instrumented.sh
+    - ./android/ci/kill-emulators.sh
+    - ./android/ci/instrumented.sh
+
+bvt-b5x-chrome-beta:
+  stage: bvt
+  needs: ["build-b5x-chrome-beta"]
+  <<: *B5X_CHROME_BETA_VARIABLES
+  <<: *B5X_BVT
+  <<: *B5X_BETA_RELEASE_RULES
+  <<: *LINUX_RUNNER_TAG
+  allow_failure: true
+  environment:
+    name: bvt-b5x
+    action: prepare
+
+bvt-b5x-chrome-stable:
+  stage: bvt
+  needs: ["build-b5x-chrome-stable"]
+  <<: *B5X_CHROME_STABLE_VARIABLES
+  <<: *B5X_BVT
+  <<: *B5X_STABLE_RELEASE_RULES
+  <<: *LINUX_RUNNER_TAG
+  allow_failure: true
+  environment:
+    name: bvt-b5x
+    action: prepare
+
+###
+### sign-packaged-code
+###
+###
+
+sign-packaged-code-windows-development: &SIGN_PACKAGED_CODE_WINDOWS_DEVELOPMENT
+  stage: sign-packaged-code
+  needs: ["build-windows", "update-version-files"]
+  cache: {}
+  <<: *MANUAL_MERGE_REQUESTS_RULE # We don't want to use the development key to sign release builds.
+  <<: *WINDOWS_DOCKER_RUNNER_TAG
+  script:
+    - Test-Path ./js/oph/dist/win-unpacked/
+    - bash -c 'echo "$OPW_DEVELOPMENT_CERT_B64" | base64 -d > DevelopmentCert.pfx'
+    - .\ci\load-cert.ps1 -CertPath ./DevelopmentCert.pfx -CertPassword "$OPW_DEVELOPMENT_CERT_PASSWORD"
+    - $cert =  Get-ChildItem -Path cert:\localMachine\my\$OPW_CERTIFICATE_THUMBPRINT
+    - .\ci\sign-recursive.ps1 -Target ./js/oph/dist/win-unpacked/ -Cert $cert
+    - Get-ChildItem -Path cert:\localMachine\my\$OPW_CERTIFICATE_THUMBPRINT | Remove-Item
+  artifacts:
+    when: always
+    paths:
+      - js/oph/dist/win-unpacked
+
+sign-packaged-code-windows-prod:
+  stage: sign-packaged-code
+  needs: ["build-windows", "update-version-files"]
+  cache: {}
+  <<: *OPH_RELEASE_RULES
+  <<: *WINDOWS_SIGNER_TAG
+  script:
+    - $cert =  Get-ChildItem -Path cert:\localMachine\my\$OPW_PROD_CERTIFICATE_THUMBPRINT
+    - .\ci\sign-recursive.ps1 -Target ./js/oph/dist/win-unpacked/ -Cert $cert
+  artifacts:
+    when: always
+    paths:
+      - js/oph/dist/win-unpacked
+
+###
+### package
+###
+package-mac-development:
+  stage: package
+  needs: ["build-mac", "update-version-files"]
+  variables:
+    ELECTRON_BUILDER_ARCH: universal
+    ELECTRON_OSX_SIGN_CSC_NAME: "Apple Development: Apple CI Runners (2MS7PD444S)"
+    SKIP_NOTARIZATION: Y
+  <<: *MANUAL_MERGE_REQUESTS_RULE
+  <<: *APPLE_RUNNER_TAG
+  script:
+    - *PACKAGE_STEPS
+  allow_failure: true #TODO remove after dev/core/core#9480
+  <<: *PACKAGE_ARTIFACTS
+
+package-mac-development-x64:
+  stage: package
+  needs: ["build-mac_x86", "update-version-files"]
+  variables:
+    ELECTRON_BUILDER_ARCH: x64
+    ELECTRON_OSX_SIGN_CSC_NAME: "Apple Development: Apple CI Runners (2MS7PD444S)"
+    SKIP_NOTARIZATION: Y
+  <<: *MANUAL_MERGE_REQUESTS_RULE
+  <<: *APPLE_RUNNER_TAG
+  script:
+    - *PACKAGE_STEPS
+  allow_failure: true #TODO remove after dev/core/core#9480
+  <<: *PACKAGE_ARTIFACTS
+
+package-mac-development-arm64:
+  stage: package
+  needs: ["build-mac_arm64", "update-version-files"]
+  variables:
+    ELECTRON_BUILDER_ARCH: arm64
+    ELECTRON_OSX_SIGN_CSC_NAME: "Apple Development: Apple CI Runners (2MS7PD444S)"
+    SKIP_NOTARIZATION: Y
+  <<: *MANUAL_MERGE_REQUESTS_RULE
+  <<: *APPLE_RUNNER_TAG
+  script:
+    - *PACKAGE_STEPS
+  allow_failure: true #TODO remove after dev/core/core#9480
+  <<: *PACKAGE_ARTIFACTS
+
+package-linux-x86:
+  stage: package
+  needs: ["build-linux-x86", "update-version-files"]
+  <<: *PACKAGE_RULES
+  <<: *LINUX_RUNNER_TAG
+  script:
+    - *LINUX_APP_CHANNEL
+    - make -C js/oph set-linux-fpm-version
+    - *PACKAGE_STEPS
+    - VERSION=$(cat foundation/op-sys-info/app.version-full | tr -d "\n")
+    - cp -a js/oph/dist/linux-unpacked js/oph/dist/1password-${VERSION}.x64
+    - pushd js/oph/dist
+    - tar -czf 1password-${VERSION}.x64.tar.gz 1password-${VERSION}.x64
+    - popd
+    # A 1password-${VERSION}.x64 directory would confused make -C js/oph dist/SHA256SUMS
+    - rm -rf js/oph/dist/1password-${VERSION}.x64
+  <<: *PACKAGE_ARTIFACTS
+
+package-linux-aarch64:
+  stage: package
+  needs: ["build-linux-aarch64", "update-version-files"]
+  <<: *PACKAGE_RULES
+  <<: *LINUX_RUNNER_TAG
+  script:
+    - *LINUX_APP_CHANNEL
+    - make -C js/oph set-linux-fpm-version
+    - export ELECTRON_BUILDER_ARCH="arm64"
+    - *PACKAGE_STEPS
+    - VERSION=$(cat foundation/op-sys-info/app.version-full | tr -d "\n")
+    - cp -a js/oph/dist/linux-arm64-unpacked js/oph/dist/1password-${VERSION}.arm64
+    - pushd js/oph/dist
+    - tar -czf 1password-${VERSION}.arm64.tar.gz 1password-${VERSION}.arm64
+    - popd
+    # A 1password-${VERSION}.arm64 directory would confused make -C js/oph dist/SHA256SUMS
+    - rm -rf js/oph/dist/1password-${VERSION}.arm64
+  <<: *PACKAGE_ARTIFACTS
+
+download-flatpak-repo:
+  stage: package
+  needs: []
+  <<: *OPH_MANUAL_RELEASE_RULES
+  <<: *LINUX_RUNNER_TAG
+  script:
+    - mkdir -p js/oph/scripts/flatpak_build_dir/repo/
+    - aws s3 sync "s3://downloads-1password-com20201013205912891100000003/linux/flatpak/repo" "js/oph/scripts/flatpak_build_dir/repo/"
+    # rust-ci has uid 0, flatpak:1.10.2-fedora has uid 1000
+    - chown -R 1000 js/oph/scripts/flatpak_build_dir/repo/
+  artifacts:
+    paths:
+      - js/oph/scripts/flatpak_build_dir/repo/
+  resource_group: "publish-flatpak"
+  environment:
+    name: publish-linux
+    action: prepare
+
+package-linux-flatpak:
+  <<: *OPH_RELEASE_RULES
+  <<: *OP_SIGNER_TAG
+  image: ${CI_REGISTRY}/ops/infrastructure/infra-ci/flatpak:1.10.2-1-fedora
+  stage: flatpak
+  needs: ["package-linux-x86", "download-flatpak-repo", "update-version-files"]
+  before_script:
+    # CI runner instance profile has access to the secret
+    - unset AWS_ACCESS_KEY_ID
+    - unset AWS_SECRET_ACCESS_KEY
+    - |
+      aws secretsmanager get-secret-value \
+        --region us-east-2 \
+        --secret-id 'arn:aws:secretsmanager:us-east-2:322190762435:secret:gitlab/1password.io/gldev/op_signer_signing_key' \
+        --output text \
+        --query SecretString \
+      | gpg --batch --import
+  script:
+    - *LINUX_APP_CHANNEL
+    # Unlock the gpg key by signing a file in a known location
+    - |
+      aws secretsmanager get-secret-value \
+        --region us-east-2 \
+        --secret-id 'arn:aws:secretsmanager:us-east-2:322190762435:secret:gitlab/1password.io/gldev/op_signer_signing_key_pass' \
+        --output text \
+        --query SecretString \
+      | gpg --pinentry-mode loopback \
+        --passphrase-fd 0 \
+        --batch \
+        --detach-sign \
+        --output /dev/null \
+        /usr/bin/env
+    - pushd js/oph/scripts
+    - flatpak install --noninteractive flathub org.electronjs.Electron2.BaseApp/x86_64/21.08
+    - flatpak install --noninteractive flathub org.freedesktop.Platform/x86_64/21.08
+    - flatpak install --noninteractive flathub org.freedesktop.Sdk/x86_64/21.08
+    - bash -x generate_flatpak.sh ../dist/*x64.tar.gz
+    - popd
+  artifacts:
+    when: always
+    paths:
+      - js/oph/scripts/flatpak_build_dir/repo/
+  resource_group: "publish-flatpak"
+
+.PACKAGE_WINDOWS: &PACKAGE_WINDOWS
+  stage: package
+  <<: *WINDOWS_DOCKER_RUNNER_TAG
+  script:
+    - powershell -Command "ci/build-windows-msi.ps1"
+    - cargo build --release -p op-windows-starter
+    - cp target\release\op-windows-starter.exe js/oph/dist/
+    - cp target/msi/1PasswordSetup.msi js/oph/dist/
+  artifacts:
+    paths:
+      - js/oph/dist/op-windows-starter.exe
+      - js/oph/dist/1PasswordSetup.msi
+      - js/oph/dist/win-unpacked/1Password.exe
+      - js/oph/dist/win-unpacked/1Password-BrowserSupport.exe
+      - 1PasswordSetup.msi
+
+package-windows-development: &PACKAGE_WINDOWS_DEVELOPMENT
+  stage: package
+  needs: ["build-windows", "update-version-files"]
+  <<: *PACKAGE_WINDOWS
+  <<: *MANUAL_MERGE_REQUESTS_RULE
+
+package-windows-prod:
+  stage: package
+  needs: ["sign-packaged-code-windows-prod", "update-version-files"]
+  <<: *PACKAGE_WINDOWS
+  <<: *OPH_RELEASE_RULES
+
+package-android:
+  stage: package
+  needs:
+    [
+      "build-android-native",
+      "update-version-files"
+    ]
+  <<: *PACKAGE_RULES
+  <<: *LINUX_RUNNER_TAG
+  script:
+    - cd android
+    - ./gradlew app:bundle
+  artifacts:
+    expose_as: "android_app_bundle"
+    when: always
+    paths:
+      - android/app/build/outputs/bundle/release/app-release.aab
+      - foundation/op-sys-info/app.relnum
+      - foundation/op-sys-info/app.buildnum
+      - foundation/op-sys-info/app.version-base
+      - foundation/op-sys-info/app.version-full
+      - foundation/op-sys-info/app.channel
+      - foundation/op-sys-info/app.latest-name
+      - js/oph/package.json
+
+package-iOS-development:
+  stage: package
+  needs: ["build-iOS", "update-version-files"]
+  extends:
+    - .MANUAL_MERGE_REQUESTS_RULE
+    - .APPLE_IOS_PACKAGE_RUNNER_TAG
+  dependencies: ["build-iOS"]
+  script:
+    # .app is build in build-iOS, passed in artifacts
+    # TODO make zip more explicit https://gitlab.1password.io/dev/core/core/-/issues/9995
+    # package .ipa for real hardware
+     - make opi-ipa opi-dSYMs opi-archive
+  allow_failure: true
+  artifacts:
+    expose_as: "ios"
+    paths:
+      - ios.xcarchive/
+      - ios_artifacts/
+      - gitlab_ci_derived_data/Logs/
+    when: always
+
+package-iOS:
+  stage: package
+  needs: ["update-version-files"]
+  <<: *OPH_RELEASE_RULES
+  <<: *APPLE_CORE_SIGNER_TAG
+  script:
+    - make -C js/oph unlock-keychain
+    - make opi-ipa opi-dSYMs opi-archive
+  after_script:
+    - security lock-keychain ~/Library/Keychains/service_account.keychain
+    - security lock-keychain ~/Library/Keychains/distribution_signing.keychain
+  allow_failure: true
+  variables:
+    OPI_EXPORT_OPTIONS: ci/ios_release.plist
+  artifacts:
+    expose_as: "ios"
+    paths:
+      - ios_artifacts/
+      - gitlab_ci_derived_data/Logs/
+    when: always
+  environment:
+    name: sign-opi
+    action: prepare
+
+package-storybook_start:
+  stage: package
+  dependencies:
+    - build-js_storybook_dev
+  <<: *JS_UI_REVIEW_ENV_BUILD_RULES
+  <<: *LINUX_RUNNER_TAG
+  script:
+    - echo "Deploy Storybook as a review app"
+  artifacts:
+    paths:
+      - js/ui/.storybook-static
+  environment:
+    name: review/$CI_COMMIT_REF_NAME
+    # Courtesy of https://stackoverflow.com/questions/60530676#60585704
+    # We have a custom GitLab Pages url, which this env uses as a base.
+    url: "https://dev.sites.gitlab.1password.io/-/core/$CI_PROJECT_NAME/-/jobs/$CI_JOB_ID/artifacts/js/ui/.storybook-static/index.html"
+    on_stop: package-storybook_stop
+    auto_stop_in: 1 week
+
+package-storybook_stop:
+  stage: package
+  <<: *JS_UI_REVIEW_ENV_BUILD_RULES_MANUAL
+  <<: *LINUX_RUNNER_TAG
+  variables:
+    GIT_STRATEGY: none
+  script:
+    - echo "Remove Storybook review app"
+  environment:
+    name: review/$CI_COMMIT_REF_NAME
+    action: stop
+
+###
+###  package-verify
+###
+# The goal of this stage is to test the install process of our supported OSes
+# https://support.1password.com/install-linux/#get-help
+
+.package-verify-rpm:
+  stage: package-verify
+  needs: ['package-linux-x86']
+  extends:
+    - .PACKAGE_RULES
+    - .LINUX_RUNNER_TAG
+  script: ./ci/package-verify/package-verify-rpm.bash
+
+.package-verify-deb:
+  stage: package-verify
+  needs: ['package-linux-x86']
+  extends:
+    - .PACKAGE_RULES
+    - .LINUX_RUNNER_TAG
+  script: ./ci/package-verify/package-verify-deb.bash
+
+package-linux-verify-rpm-fedora29:
+  needs: ['package-linux-x86']
+  extends:
+    - .package-verify-rpm
+  image: fedora:29
+
+package-linux-verify-rpm-fedora30:
+  needs: ['package-linux-x86']
+  extends:
+    - .package-verify-rpm
+  image: fedora:30
+
+package-linux-verify-rpm-fedora31:
+  needs: ['package-linux-x86']
+  extends:
+    - .package-verify-rpm
+  image: fedora:31
+
+package-linux-verify-rpm-fedora32:
+  needs: ['package-linux-x86']
+  extends:
+    - .package-verify-rpm
+  image: fedora:32
+
+package-linux-verify-rpm-fedora33:
+  needs: ['package-linux-x86']
+  extends:
+    - .package-verify-rpm
+  image: fedora:33
+
+package-linux-verify-rpm-fedora34:
+  needs: ['package-linux-x86']
+  extends:
+    - .package-verify-rpm
+  image: fedora:34
+
+package-linux-verify-rpm-fedora35:
+  extends:
+    - .package-verify-rpm
+  image: fedora:35
+
+package-linux-verify-rpm-opensuse:
+  extends:
+    - .package-verify-rpm
+  image: opensuse/leap
+  allow_failure: true # Remove allow_failure after the job is fixed. https://gitlab.1password.io/dev/core/core/-/issues/14060
+
+package-linux-verify-rpm-centos8:
+  needs: ['package-linux-x86']
+  extends:
+    - .package-verify-rpm
+  image: centos:8
+  allow_failure: true # Remove allow_failure after the job is fixed. https://gitlab.1password.io/dev/core/core/-/issues/13249
+
+package-linux-verify-deb-debian10:
+  needs: ['package-linux-x86']
+  extends:
+    - .package-verify-deb
+  image: debian:10
+
+package-linux-verify-deb-debian11:
+  extends:
+    - .package-verify-deb
+  image: debian:11
+
+package-linux-verify-deb-ubuntu20:
+  needs: ['package-linux-x86']
+  extends:
+    - .package-verify-deb
+  image: ubuntu:20.04
+
+upload-translation-source:
+  stage: build
+  needs: []
+  <<: *LINUX_RUNNER_TAG
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "schedule" && $CI_UPLOAD_CROWDIN_TRANSLATIONS == "Y"'
+  script:
+    - cd op-localization
+    - java -jar /opt/crowdin-cli.jar upload sources --token="${CROWDIN_TOKEN}" --verbose
+  interruptible: false
+  environment:
+    name: corebot
+    action: prepare
+
+download-translations:
+  stage: build
+  needs: []
+  <<: *LINUX_RUNNER_TAG
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "schedule" && $CI_DOWNLOAD_CROWDIN_TRANSLATIONS == "Y"'
+  before_script:
+    # To push, we need a GPG singed commit and a user-specific gitlab personal access token
+    - git remote set-url origin https://${COREBOT_USERNAME}:${COREBOT_GITLAB_TOKEN}@gitlab.1password.io/dev/core/core.git
+    - git config --global user.name "${COREBOT_USERNAME}"
+    - git config --global user.email "${COREBOT_GITLAB_EMAIL}"
+    - git config --global user.signingkey "${COREBOT_GPG_KEY_ID}"
+    - git config --global commit.gpgsign true
+  script:
+    - sh ./ci/build/download-translations.sh
+  artifacts:
+    paths:
+      - op-localization/data/*.json
+    expire_in: 1 week
+  # Remove all gpg keys
+  after_script:
+    - gpgconf --kill gpg-agent;
+    - rm -rf $HOME/.gnupg;
+    - gpg --list-secret-keys | wc -l
+  environment:
+    name: corebot
+    action: prepare
+
+tag-nightly-build:
+  stage: canary
+  needs: []
+  <<: *LINUX_RUNNER_TAG
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "schedule" && $CI_TAG_NIGHTLY_RELEASE == "Y"'
+  script:
+    - ci/canary/tag-nightly.bash
+  after_script:
+    - gpgconf --kill gpg-agent;
+    - rm -rf $HOME/.gnupg;
+    - gpg --list-secret-keys | wc -l
+  resource_group: tag-nightly
+  interruptible: true
+  environment:
+    name: corebot
+    action: prepare
+
+###
+###  sign
+###
+sign-android:
+  stage: sign
+  needs: ["package-android", "update-version-files"]
+  # Use an image with a minimal toolchain to reduce attack surface. See rust-ci/android-signer
+  # Latest Branch: Rust 1.59 https://gitlab.1password.io/dev/core/rust-ci/-/merge_requests/190
+  image: ${CI_REGISTRY}/dev/core/rust-ci@sha256:a32a5e322aa321bcdd052fc30f08b9ac3064f9dcb441d536c19d51ea5689a546
+  <<: *OPH_RELEASE_RULES
+  <<: *OP_SIGNER_TAG
+  before_script:
+    # CI runner instance profile has access to the secret
+    - unset AWS_ACCESS_KEY_ID
+    - unset AWS_SECRET_ACCESS_KEY
+    - |
+      aws secretsmanager get-secret-value \
+        --region us-east-2 \
+        --secret-id 'arn:aws:secretsmanager:us-east-2:322190762435:secret:gitlab/1password.io/gldev/op_signer_opa8_upload_keystore_b64' \
+        --output text \
+        --query SecretBinary \
+      | base64 -d > android_keystore.jks
+    - |
+      aws secretsmanager get-secret-value \
+        --region us-east-2 \
+        --secret-id 'arn:aws:secretsmanager:us-east-2:322190762435:secret:gitlab/1password.io/gldev/op_signer_opa8_storepass' \
+        --output text \
+        --query SecretString > storepass
+    - |
+      aws secretsmanager get-secret-value \
+        --region us-east-2 \
+        --secret-id 'arn:aws:secretsmanager:us-east-2:322190762435:secret:gitlab/1password.io/gldev/op_signer_opa8_keypass' \
+        --output text \
+        --query SecretString > keypass
+  script:
+    - jarsigner -verbose -sigalg SHA256withRSA -digestalg SHA-256 -keystore android_keystore.jks -storepass:file storepass -keypass:file keypass android/app/build/outputs/bundle/release/app-release.aab $OPA8_UPLOAD_KEYSTORE_ALIAS
+  after_script:
+    # should be automatically cleaned up anyway
+    - rm -f android_keystore.jks
+    - rm -rf storepass
+    - rm -rf keypass
+  artifacts:
+    paths:
+      - android/app/build/outputs/bundle/release/app-release.aab
+
+sign-linux-x86:
+  stage: sign
+  needs: ["package-linux-x86", "update-version-files"]
+  <<: *OPH_RELEASE_RULES
+  <<: *OP_SIGNER_TAG
+  <<: *OPH_SIGN_LINUX
+
+sign-linux-aarch64:
+  stage: sign
+  needs: ["package-linux-aarch64", "update-version-files"]
+  <<: *OPH_RELEASE_RULES
+  <<: *OP_SIGNER_TAG
+  <<: *OPH_SIGN_LINUX
+
+sign-windows-installer-development: &SIGN_WINDOWS_INSTALLER_DEVELOPMENT
+  stage: sign
+  needs: ["package-windows-development", "update-version-files"]
+  cache: {}
+  <<: *MANUAL_MERGE_REQUESTS_RULE
+  <<: *WINDOWS_DOCKER_RUNNER_TAG
+  script:
+    - bash -c 'echo "$OPW_DEVELOPMENT_CERT_B64" | base64 -d > DevelopmentCert.pfx'
+    - .\ci\load-cert.ps1 -CertPath ./DevelopmentCert.pfx -CertPassword "$OPW_DEVELOPMENT_CERT_PASSWORD"
+    - $cert =  Get-ChildItem -Path cert:\localMachine\my\$OPW_CERTIFICATE_THUMBPRINT
+    - .\ci\sign-recursive.ps1 -Target ./js/oph/dist/op-windows-starter.exe -Cert $cert
+    - .\ci\sign-recursive.ps1 -Target ./js/oph/dist/1PasswordSetup.msi -Cert $cert
+    - New-Item -ItemType Directory -Force -Path "./ci-dist"
+    - $version= type foundation/op-sys-info/app.version-full
+    - $latest= type foundation/op-sys-info/app.latest-name
+    - cp js/oph/dist/op-windows-starter.exe ci-dist/1PasswordSetup-$version.exe
+    - cp js/oph/dist/op-windows-starter.exe ci-dist/1PasswordSetup-$latest.exe
+    - cp js/oph/dist/1PasswordSetup.msi ci-dist/1PasswordSetup-$latest.msi
+    - cp js/oph/dist/1PasswordSetup.msi ci-dist/1PasswordSetup-$version.msi
+    - cp js/oph/dist/win-unpacked/1Password.exe ci-dist/
+    - cp js/oph/dist/win-unpacked/1Password-BrowserSupport.exe ci-dist/
+    - Get-ChildItem -Path cert:\localMachine\my\$OPW_CERTIFICATE_THUMBPRINT | Remove-Item
+  artifacts:
+    when: always
+    expose_as: "signed-windows-installer"
+    paths:
+      - js/oph/dist/op-windows-starter.exe
+      - js/oph/dist/win-unpacked/1Password.exe
+      - js/oph/dist/win-unpacked/1Password-BrowserSupport.exe
+      - ci-dist
+  allow_failure: true
+
+sign-windows-installer-prod:
+  stage: sign
+  needs: ["package-windows-prod", "update-version-files"]
+  cache: {}
+  <<: *OPH_RELEASE_RULES
+  <<: *WINDOWS_SIGNER_TAG
+  script:
+    - $cert =  Get-ChildItem -Path cert:\localMachine\my\$OPW_PROD_CERTIFICATE_THUMBPRINT
+    - .\ci\sign-recursive.ps1 -Target ./js/oph/dist/op-windows-starter.exe -Cert $cert
+    - .\ci\sign-recursive.ps1 -Target ./js/oph/dist/1PasswordSetup.msi -Cert $cert
+    - $version= type foundation/op-sys-info/app.version-full
+    - $latest= type foundation/op-sys-info/app.latest-name
+    - New-Item -ItemType Directory -Force -Path "./ci-dist"
+    - cp ./js/oph/dist/op-windows-starter.exe ./ci-dist/1PasswordSetup-$version.exe
+    - cp ./js/oph/dist/op-windows-starter.exe ./ci-dist/1PasswordSetup-$latest.exe
+    - cp ./js/oph/dist/1PasswordSetup.msi ./ci-dist/1PasswordSetup-$latest.msi
+    - cp ./js/oph/dist/1PasswordSetup.msi ./ci-dist/1PasswordSetup-$version.msi
+  artifacts:
+    when: always
+    expose_as: "signed-windows-installer"
+    paths:
+      - foundation/op-sys-info/app.version-full
+      - js/oph/dist/1PasswordSetup.msi
+      - js/oph/dist/op-windows-starter.exe
+      - js/oph/dist/win-unpacked/1Password.exe
+      - js/oph/dist/win-unpacked/1Password-BrowserSupport.exe
+      - ci-dist
+  allow_failure: true
+
+.package-sign-mac-universal:
+  stage: package
+  <<: *NEEDS_CANARY
+  <<: *OPH_RELEASE_RULES
+  <<: *APPLE_CORE_SIGNER_TAG
+  before_script:
+    - time ./ci/get-install-toolchain js-ci
+  script:
+    - make js-bootstrap
+    - make oph
+    - make -C js/oph unlock-keychain
+    - make -C js/oph copy-prod-profile
+    - make -C js/oph package
+  after_script:
+    - security lock-keychain ~/Library/Keychains/service_account.keychain
+    - security lock-keychain ~/Library/Keychains/distribution_signing.keychain
+  artifacts:
+    when: always
+    paths:
+      - js/oph/dist
+      - js/oph/package.json
+      - apple/Shared/Supporting/1Password-Version-iOS.xcconfig
+      - apple/Shared/Supporting/1Password-Version-Mac.xcconfig
+      - ci/changelog/opm/CHANGELOG
+      - ci/changelog/opw/CHANGELOG
+    exclude:
+      - js/oph/dist/app/
+      - js/oph/dist/browser-helper.xcarchive/
+      - js/oph/dist/1Password Browser Helper.app/
+      - js/oph/dist/mac
+      - js/oph/dist/mac-arm64
+      - js/oph/dist/mac-universal
+      - js/oph/dist/mas
+      - js/oph/dist/mas-arm64
+      - js/oph/dist/mas-universal
+  variables:
+    # These values being environment variables provides js/oph/Makefile values for production signing
+    BROWSER_HELPER_BUILD_TYPE: Release
+    ELECTRON_BUILDER_ARCH: universal
+    PROVISIONING_PROFILE: "./build_system/mac/embedded.provisionprofile" #relative to js/oph
+    GATEKEEPER_ASSESS: "true"
+    ELECTRON_OSX_SIGN_CSC_NAME: AgileBits Inc. (2BUA8C4S2C)
+    PROD_NOTARIZE: Y
+    EXPORT_OPTIONS: Release
+    # Without the "Developer ID Application:" prefix, codesign will fail if there
+    # are multiple AgileBits certs on the build machine.
+    CSC_DARWIN_BROWSER: "Developer ID Application: AgileBits Inc. (2BUA8C4S2C)"
+    OP_BUILD_TYPE: release
+  environment:
+    name: sign-opm
+    action: prepare
+
+package-sign-mac-x86_64:
+  extends: .package-sign-mac-universal
+  variables:
+    ELECTRON_BUILDER_ARCH: x64
+    TARGET_ARCH: x86_64-apple-darwin
+
+package-sign-mac-aarch64:
+  extends: .package-sign-mac-universal
+  variables:
+    # These values being environment variables provides js/oph/Makefile values for production signing
+    ELECTRON_BUILDER_ARCH: arm64
+    TARGET_ARCH: aarch64-apple-darwin
+
+upload-ios-store-metadata:
+  stage: publish
+  <<: *OPH_PUBLISH_RULES
+  <<: *APPLE_CORE_SIGNER_TAG
+  needs: []
+  script:
+    - make fastlane-ios-metadata-upload
+  after_script:
+    - security lock-keychain ~/Library/Keychains/service_account.keychain
+  environment:
+    name: sign-opm
+    action: prepare
+
+upload-ios-all:
+  stage: publish
+  <<: *OPH_PUBLISH_AUTOMATIC_NIGHTLY_RULES
+  <<: *APPLE_CORE_SIGNER_TAG
+  needs: ["package-iOS"]
+  script:
+    - make fastlane-ios-all-upload
+  after_script:
+    - security lock-keychain ~/Library/Keychains/service_account.keychain
+  environment:
+    name: sign-opm
+    action: prepare
+
+package-sign-safari:
+  stage: package
+  needs: []
+  <<: *B5X_STABLE_RELEASE_RULES
+  <<: *APPLE_CORE_SIGNER_TAG
+  before_script:
+    - time ./ci/get-install-toolchain js-ci
+  script:
+    - make -C js b5x
+    - make -C js/b5x/background/mv2 package
+    - make -C js/b5x/background/mv2 update-swe-versions
+    - make apple-web-extension
+    - security unlock-keychain -p $OPM_SERVICE_ACCOUNT_KEYCHAIN ~/Library/Keychains/service_account.keychain
+    - ruby js/oph/scripts/unlock_distribution_keychain.rb
+    - xcodebuild archive -workspace apple/1Password.xcworkspace -scheme "Safari App" -configuration Release -archivePath safari.xcarchive -derivedDataPath ./gitlab_ci_derived_data
+    - mkdir -p js/b5x/background/mv2/dist/safari-app
+    - xcodebuild -exportArchive -archivePath safari.xcarchive -exportPath js/b5x/background/mv2/dist/safari-app -exportOptionsPlist apple/macOS/build_system/exportOptions/ExportOptions-Release.plist
+    - pushd js/b5x/background/mv2/dist/safari-app
+    - ditto -c -k  --sequesterRsrc --keepParent "1Password for Safari.app" "1Password for Safari.zip"
+    - popd
+    - ditto -c -k --sequesterRsrc --keepParent safari.xcarchive safari.xcarchive.zip
+    - xcodebuild -exportArchive -archivePath safari.xcarchive -exportPath js/b5x/background/mv2/dist/safari-mas -exportOptionsPlist ci/swe_mas_release.plist
+    - ci/package/notarize-internal-swe.bash
+  after_script:
+    - security lock-keychain ~/Library/Keychains/service_account.keychain
+    - security lock-keychain ~/Library/Keychains/distribution_signing.keychain
+  artifacts:
+    when: always
+    paths:
+      - gitlab_ci_derived_data/Logs
+      - safari.xcarchive.zip
+      - js/b5x/background/mv2/dist/safari-app
+      - js/b5x/background/mv2/dist/safari-mas
+  variables:
+    CHANNEL: stable
+    BROWSER: safari-macos
+    OP_APPLE_BUILD_TYPE: release
+    OP_BUILD_TYPE: release
+  environment:
+    name: sign-opm
+    action: prepare
+
+# Signs and notarizes the MacOS 64-bit universal binary release
+sign-opio_macos:
+  stage: sign
+  needs: ["build-opio-release_macos_x64", "build-opio-release-macos_arm64"]
+  <<: *OPIO_RELEASE_RULES
+  <<: *APPLE_OPIO_SIGNER_TAG
+  script:
+    - echo "Make a universal binary for `opio`."
+    - lipo ./target/release/opio_aarch64 ./target/release/opio_x64 -create -output ./opio
+    - echo "Signing opio's release binary..."
+    - codesign -f -s "Developer ID Application" --options=runtime --keychain "op_signing.keychain" ./opio
+    # Create the package file
+    - echo "Creating the opio package file..."
+    - packagesbuild -v --package-version=$(cat ./target/opio.version) ./op-import-export/ci/opio.pkgproj
+    - echo "Package created, signing..."
+    - 'productsign --sign "Developer ID Installer: AgileBits Inc. (2BUA8C4S2C)" --keychain "op_signing.keychain" ./opio.pkg ./opio.pkgs'
+    - echo "Signing completed"
+    - mv ./opio.pkgs ./opio_macos_x64+aarch64_$(cat ./target/opio.version).pkg
+    - echo "Notarizing and stapling release package..."
+    - ruby ./ci/notarize.rb --path ./opio_macos_x64+aarch64_$(cat ./target/opio.version).pkg --bundle com.1password.opio --zip-first --keychain_item notarize
+    - echo "Created, signed, notarized, and stapled opio's release!"
+  artifacts:
+    when: always
+    paths:
+      - opio_macos_x64+aarch64_$(cat ./target/opio.version).pkg
+    name: "opio_macos_x64+aarch64"
+
+# Signs the Windows 64-bit version of `opio`.
+sign-opio_windows_x64:
+  <<: *WINDOWS_SIGNER_TAG
+  stage: sign
+  needs: ["build-opio-release_windows_x64"]
+  <<: *OPIO_RELEASE_RULES
+  <<: *SIGN_OPIO_WINDOWS
+  after_script:
+    - mv ./opio.exe opio_windows_x64_$(cat ./target/opio.version).exe
+  artifacts:
+    paths:
+      - ./opio_windows*.**
+    name: "opio_windows_x64"
+
+# Signs the Windows 32-bit version of `opio`.
+sign-opio_windows_x86:
+  <<: *WINDOWS_SIGNER_TAG
+  stage: sign
+  needs: ["build-opio-release_windows_x86"]
+  <<: *OPIO_RELEASE_RULES
+  <<: *SIGN_OPIO_WINDOWS
+  after_script:
+    - mv ./opio.exe opio_windows_x86_$(cat ./target/opio.version).exe
+  artifacts:
+    paths:
+      - ./opio_windows*.**
+    name: "opio_windows_x86"
+
+# Signs the linux 64-bit version of `opio`.
+sign-opio_linux_x64:
+  stage: sign
+  needs: ["build-opio-release_linux_x64"]
+  <<: *OPIO_RELEASE_RULES
+  <<: *OP_SIGNER_TAG
+  <<: *SIGN_OPIO_LINUX
+  after_script:
+    - mv ./opio opio_linux_x64_$(cat ./target/opio.version)
+    - mv ./opio.asc opio_linux_x64_$(cat ./target/opio.version).asc
+  artifacts:
+    paths:
+      - ./opio_linux_x64*.**
+    name: "opio_linux_x64"
+
+# Signs the linux 32-bit version of `opio`.
+sign-opio_linux_x86:
+  stage: sign
+  needs: ["build-opio-release_linux_x86"]
+  <<: *OPIO_RELEASE_RULES
+  <<: *OP_SIGNER_TAG
+  <<: *SIGN_OPIO_LINUX
+  after_script:
+    - mv ./opio opio_linux_x86_$(cat ./target/opio.version)
+    - mv ./opio.asc opio_linux_x86_$(cat ./target/opio.version).asc
+  artifacts:
+    paths:
+      - ./opio_linux_x86*.**
+    name: "opio_linux_x86"
+
+# Signs the linux ARM 64-bit (aarch64) version of `opio`.
+sign-opio_linux_aarch64:
+  stage: sign
+  needs: ["build-opio-release_linux_aarch64"]
+  <<: *OPIO_RELEASE_RULES
+  <<: *OP_SIGNER_TAG
+  <<: *SIGN_OPIO_LINUX
+  after_script:
+    - mv ./opio opio_linux_aarch64_$(cat ./target/opio.version)
+    - mv ./opio.asc opio_linux_aarch64_$(cat ./target/opio.version).asc
+  artifacts:
+    paths:
+      - ./opio_linux_aarch64*.**
+    name: "opio_linux_aarch64"
+
+# Signs the linux ARM 32-bit (armv7) version of `opio`.
+sign-opio_linux_armv7:
+  stage: sign
+  needs: ["build-opio-release_linux_armv7"]
+  <<: *OPIO_RELEASE_RULES
+  <<: *OP_SIGNER_TAG
+  <<: *SIGN_OPIO_LINUX
+  after_script:
+    - mv ./opio opio_linux_armv7_$(cat ./target/opio.version)
+    - mv ./opio.asc opio_linux_armv7_$(cat ./target/opio.version).asc
+  artifacts:
+    paths:
+      - ./opio_linux_armv7*.**
+    name: "opio_linux_armv7"
+
+###
+### sign-verify
+### this stage is to verify the signatures on the packages before releasing them
+sign-verify-linux-rpm:
+  stage: sign-verify
+  extends:
+    - .OPH_RELEASE_RULES
+  image: fedora:latest # current stable release
+  tags:
+    - xplatform-rev2
+  needs: ["sign-linux-x86", "update-version-files"]
+  script:
+    - ./ci/sign-verify/sign-verify-linux-rpm.bash
+
+sign-verify-linux-rpm-upcoming:
+  stage: sign-verify
+  extends:
+    - .OPH_RELEASE_RULES
+  image: fedora:rawhide  # upcoming release
+  tags:
+    - xplatform-rev2
+  needs: ["sign-linux-x86", "update-version-files"]
+  script:
+    - ./ci/sign-verify/sign-verify-linux-rpm.bash
+  # we only want to know about upcoming breaking changes so they can be fixed
+  allow_failure: true
+
+# For beta/production releases `virustotal-upload` should be run after OPW has passed RCT.
+virustotal-upload:
+  stage: publish
+  needs: ["sign-windows-installer-prod", "update-version-files"]
+  <<: *OPH_PUBLISH_AUTOMATIC_NIGHTLY_RULES
+  <<: *LINUX_RUNNER_TAG
+  resource_group: virus-total
+  script:
+    - export VERSION=$(cat foundation/op-sys-info/app.version-full)
+    - export CHANNEL=$(cat foundation/op-sys-info/app.channel)
+    - FOLDER_BASE=Core ci/publish/upload-virustotal.bash
+  interruptible: false
+  # virustotal-upload has `allow_failure: true`, since `publish-windows` depends
+  # on it. We will not be blocked from publishing in the event we are over the
+  # virustotal quota, or their API is down.
+  # As a result, it is possible to automatically release a nightly that has not
+  # been uploaded to VirusTotal.
+  allow_failure: true
+  environment:
+    name: virus-total
+    action: prepare
+
+linux-deb-repo-x86:
+  stage: publish-prereqs
+  needs: ["sign-linux-x86", "update-version-files"]
+  <<: *OPH_OP_CLI_SYNC_RELEASE_RULES
+  <<: *OP_SIGNER_TAG
+  image: ${CI_REGISTRY}/ops/infrastructure/infra-ci/aptly:1.4.0-7
+  before_script:
+    # CI runner instance profile has access to the secret
+    - unset AWS_ACCESS_KEY_ID
+    - unset AWS_SECRET_ACCESS_KEY
+    - |
+      aws secretsmanager get-secret-value \
+        --region us-east-2 \
+        --secret-id 'arn:aws:secretsmanager:us-east-2:322190762435:secret:gitlab/1password.io/gldev/op_signer_signing_key' \
+        --output text \
+        --query SecretString \
+      | gpg --batch --import
+  script:
+    # Unlock the gpg key by signing a file in a known location
+    - |
+      aws secretsmanager get-secret-value \
+        --region us-east-2 \
+        --secret-id 'arn:aws:secretsmanager:us-east-2:322190762435:secret:gitlab/1password.io/gldev/op_signer_signing_key_pass' \
+        --output text \
+        --query SecretString \
+      | gpg --pinentry-mode loopback \
+        --passphrase-fd 0 \
+        --batch \
+        --detach-sign \
+        --output /dev/null \
+        /usr/bin/env
+
+    - export DEB_SIGNING_KEY_ID=3FEF9748469ADBE15DA7CA80AC2D62742012EA22
+    - *LINUX_APP_CHANNEL
+
+    # We don't need to do this gpg import, but I think it's useful for reference, or if someone wants to do a dry run.
+    - curl -sS https://downloads.1password.com/linux/keys/1password.asc | gpg --no-default-keyring --keyring trustedkeys.gpg --import;
+
+      # Merge the remote repo for $APP_CHANNEL with the new .deb. Keep only the latest version of each package. (So we don't overwrite the CLI)
+    - export remote_mirror_name=my-mirror;
+    # we are currently only releasing the amd64 package
+    - aptly mirror create $remote_mirror_name https://downloads.1password.com/linux/debian/amd64 "$APP_CHANNEL" main
+    - aptly mirror update $remote_mirror_name;
+    - export remote_snapshot_name="remote-snapshot";
+    - aptly snapshot create $remote_snapshot_name from mirror $remote_mirror_name;
+    - export local_repo_name=local-repo;
+    - aptly repo create -distribution="$APP_CHANNEL" $local_repo_name;
+    - aptly repo add $local_repo_name js/oph/dist/1password-*.amd64.deb;
+    - export local_snapshot_name="local-snapshot";
+    - aptly snapshot create $local_snapshot_name from repo $local_repo_name
+    - export merged_snapshot_name="merged-snapshot"
+    - aptly snapshot merge -latest $merged_snapshot_name $remote_snapshot_name $local_snapshot_name
+    - aptly publish snapshot -gpg-key="$DEB_SIGNING_KEY_ID" -distribution="$APP_CHANNEL" $merged_snapshot_name
+
+    # Move the new apt repo to js/oph/dist/
+    - cp -r /root/.aptly/public/ ./js/oph/dist/apt-repo
+  after_script:
+    - gpg --batch --yes --delete-secret-keys 3FEF9748469ADBE15DA7CA80AC2D62742012EA22
+  artifacts:
+    when: always
+    paths:
+      - js/oph/dist
+
+linux-rpm-repo-x86:
+  stage: publish-prereqs
+  needs: ["sign-linux-x86", "update-version-files"]
+  <<: *OPH_OP_CLI_SYNC_RELEASE_RULES
+  <<: *OP_SIGNER_TAG
+  image: ${CI_REGISTRY}/ops/infrastructure/infra-ci/rpm_tools:1.0.1-1-centos
+  before_script:
+    # CI runner instance profile has access to the secret
+    - unset AWS_ACCESS_KEY_ID
+    - unset AWS_SECRET_ACCESS_KEY
+    - |
+      aws secretsmanager get-secret-value \
+        --region us-east-2 \
+        --secret-id 'arn:aws:secretsmanager:us-east-2:322190762435:secret:gitlab/1password.io/gldev/op_signer_signing_key' \
+        --output text \
+        --query SecretString \
+      | gpg --batch --import
+  script:
+    - *LINUX_APP_CHANNEL
+    - ci/publish-prereqs/linux-rpm-repo-x86.bash
+  after_script:
+    - gpg --batch --yes --delete-secret-keys 3FEF9748469ADBE15DA7CA80AC2D62742012EA22
+  artifacts:
+    when: always
+    paths:
+      - js/oph/dist
+
+###
+### publish
+###
+pages:
+  stage: publish
+  dependencies:
+    - build-rustdocs
+    - build-core-book
+    - build-brain-book
+    - build-js_storybook
+  <<: *MAIN_RULE
+  <<: *LINUX_RUNNER_TAG
+  script:
+    - mkdir -p public
+    - mv rs/main-index.html public/index.html
+    - mv rs public/rs
+    - mv book public/book
+    - mv brain public/brain
+    - mv js/ui/.storybook-static public/storybook
+  artifacts:
+    paths:
+      - public
+
+publish-mac:
+  stage: publish
+  needs: ["package-sign-mac-x86_64", "package-sign-mac-aarch64", "update-version-files"]
+  <<: *OPH_PUBLISH_AUTOMATIC_NIGHTLY_RULES
+  <<: *LINUX_RUNNER_TAG
+  resource_group: publish-mac
+  script:
+    - ci/publish/publish-mac.bash
+  artifacts:
+    when: always
+    expose_as: "signed-mac"
+    paths:
+      - ci-dist
+  interruptible: false
+  environment:
+    name: publish-opm
+    action: prepare
+
+# temporary job, remove after OPM GA dev/core/core#14279
+# https://gitlab.1password.io/dev/core/core/-/issues/14279
+tmp-just-upload-mac-latest-zip:
+  stage: publish
+  needs: ["package-sign-mac-x86_64", "package-sign-mac-aarch64", "update-version-files"]
+  <<: *OPH_PUBLISH_RULES
+  <<: *LINUX_RUNNER_TAG
+  resource_group: publish-mac
+  script:
+    - ci/publish/tmp-just-upload-mac-latest-zip.bash
+  artifacts:
+    when: always
+    expose_as: "signed-mac"
+    paths:
+      - ci-dist
+  interruptible: false
+  environment:
+    name: publish-opm
+    action: prepare
+
+publish-mac-installer:
+  stage: publish
+  needs: ["package-sign-mac-installer", "update-version-files"]
+  <<: *OPH_PUBLISH_RULES
+  <<: *LINUX_RUNNER_TAG
+  resource_group: publish-mac
+  script:
+    - ci/publish/publish-mac-installer.bash
+  artifacts:
+    when: always
+    expose_as: "signed-mac-installer"
+    paths:
+      - ci-dist
+  interruptible: false
+  environment:
+    name: publish-opm
+    action: prepare
+
+publish-linux-tar-x86:
+  stage: publish-prereqs
+  needs: ["sign-linux-x86", "update-version-files"]
+  <<: *OPH_PUBLISH_AUTOMATIC_NIGHTLY_RULES
+  <<: *LINUX_RUNNER_TAG
+  resource_group: publish-linux-tar
+  script:
+    # Cache Length:
+    # - versioned files for 1 year
+    # - unversioned and metadata for 1 day
+    - *LINUX_APP_CHANNEL
+    # tar.gz
+    # this job only has the x86_64 files. (It does not rely on sign-linux-aarch64)
+    - cp foundation/op-sys-info/app.version-full js/oph/dist/LATEST
+    - aws s3 sync --cache-control "max-age=31536000,must-revalidate" --exclude "*" --include LATEST --include "1password-*.tar.gz" --include "1password-*.tar.gz.sig" js/oph/dist "s3://downloads-1password-com20201013205912891100000003/linux/tar/${APP_CHANNEL}/x86_64"
+    # Latest tar.gz
+    - cp js/oph/dist/1password-*.tar.gz js/oph/dist/1password-latest.tar.gz
+    - cp js/oph/dist/1password-*.tar.gz.sig js/oph/dist/1password-latest.tar.gz.sig
+    - aws s3 sync --cache-control "max-age=86400,must-revalidate" --exclude "*" --include "1password-latest.tar.gz" --include "1password-latest.tar.gz.sig" js/oph/dist "s3://downloads-1password-com20201013205912891100000003/linux/tar/${APP_CHANNEL}/x86_64"
+    # Clear the CloudFront cache for /linux/tar/${APP_CHANNEL}/x86_64
+    - aws cloudfront create-invalidation --distribution-id "${AWS_CLOUDFRONT_ID}" --paths "/linux/tar/${APP_CHANNEL}/x86_64/*"
+  interruptible: false
+  environment:
+    name: publish-linux
+    action: prepare
+
+publish-linux-tar-aarch64:
+  stage: publish-prereqs
+  needs: ["sign-linux-aarch64", "update-version-files"]
+  <<: *OPH_PUBLISH_AUTOMATIC_NIGHTLY_RULES
+  <<: *LINUX_RUNNER_TAG
+  resource_group: publish-linux-tar
+  script:
+    # Cache Length:
+    # - versioned files for 1 year
+    # - unversioned and metadata for 1 day
+    - *LINUX_APP_CHANNEL
+    # tar.gz
+    # this job only has the aarch64 files. (It does not rely on sign-linux-x86)
+    - cp foundation/op-sys-info/app.version-full js/oph/dist/LATEST
+    - aws s3 sync --cache-control "max-age=31536000,must-revalidate" --exclude "*" --include LATEST --include "1password-*.tar.gz" --include "1password-*.tar.gz.sig" js/oph/dist "s3://downloads-1password-com20201013205912891100000003/linux/tar/${APP_CHANNEL}/aarch64"
+    # Latest tar.gz
+    - cp js/oph/dist/1password-*.tar.gz js/oph/dist/1password-latest.tar.gz
+    - cp js/oph/dist/1password-*.tar.gz.sig js/oph/dist/1password-latest.tar.gz.sig
+    - aws s3 sync --cache-control "max-age=86400,must-revalidate" --exclude "*" --include "1password-latest.tar.gz" --include "1password-latest.tar.gz.sig" js/oph/dist "s3://downloads-1password-com20201013205912891100000003/linux/tar/${APP_CHANNEL}/aarch64"
+    # Clear the CloudFront cache for /linux/tar/${APP_CHANNEL}/aarch64
+    - aws cloudfront create-invalidation --distribution-id "${AWS_CLOUDFRONT_ID}" --paths "/linux/tar/${APP_CHANNEL}/aarch64/*"
+  interruptible: false
+  environment:
+    name: publish-linux
+    action: prepare
+
+archive-linux-snapcraft:
+  stage: publish-prereqs
+  needs: ["sign-linux-x86", "update-version-files"]
+  <<: *OPH_PUBLISH_RULES
+  <<: *LINUX_RUNNER_TAG
+  resource_group: publish-linux-snapcraft
+  script:
+    # Cache Length:
+    # - versioned files for 1 year
+    # - unversioned and metadata for 1 day
+    - *LINUX_APP_CHANNEL
+    # Archive published snap file to S3. Users install from snapcraft
+    # we only build amd64 right now
+    - aws s3 sync --cache-control "max-age=31536000,must-revalidate" --exclude "*" --include "1password-*.snap" js/oph/dist "s3://downloads-1password-com20201013205912891100000003/linux/snap/${APP_CHANNEL}/amd64"
+    # Clear the CloudFront cache for /linux/snap/${APP_CHANNEL}/amd64
+    - aws cloudfront create-invalidation --distribution-id "${AWS_CLOUDFRONT_ID}" --paths "/linux/snap/${APP_CHANNEL}/amd64/*"
+  interruptible: false
+  environment:
+    name: publish-linux
+    action: prepare
+
+publish-linux-deb:
+  stage: publish
+  needs: ["linux-deb-repo-x86", "update-version-files"]
+  <<: *OPH_PUBLISH_AUTOMATIC_NIGHTLY_RULES
+  <<: *LINUX_RUNNER_TAG
+  resource_group: publish-linux-deb
+  script:
+    # Cache Length:
+    # - versioned files for 1 year
+    # - unversioned and metadata for 1 day
+    # debs - There is 1 pool shared between the app channels (distributions)
+    # we only build amd64 right now
+    - *LINUX_APP_CHANNEL
+    - |
+      for file in js/oph/dist/apt-repo/pool/main/1/1password/*; do
+        if aws s3api head-object --bucket=downloads-1password-com20201013205912891100000003 --key="linux/debian/amd64/pool/main/1/1password/$(basename "${file}")" >/dev/null 2>&1; then
+          echo "ERROR: $(basename "${file}") will overwrite existing release. Aborting."
+          exit 1
+        fi
+      done
+    # debsig policy
+    - aws s3 sync --cache-control "max-age=86400,must-revalidate" --exclude "*" --include "1password.pol" js/oph/resources/debsig s3://downloads-1password-com20201013205912891100000003/linux/debian/debsig
+    # upload the debs to the /pool before updating the metadata in /dists
+    # we only build amd64 right now
+    - aws s3 sync --cache-control "max-age=31536000,must-revalidate" js/oph/dist/apt-repo/pool s3://downloads-1password-com20201013205912891100000003/linux/debian/amd64/pool
+    # apt repo for debs - /apt-repo/dists already contains the directory for the app-channel
+    # we only build amd64 right now
+    - aws s3 sync --cache-control "max-age=86400,must-revalidate" js/oph/dist/apt-repo/dists s3://downloads-1password-com20201013205912891100000003/linux/debian/amd64/dists
+    # Latest deb
+    # we only build amd64 right now
+    - cp js/oph/dist/1password-*.deb js/oph/dist/1password-latest.deb
+    - aws s3 sync --cache-control "max-age=86400,must-revalidate" --exclude "*" --include "1password-latest.deb" js/oph/dist "s3://downloads-1password-com20201013205912891100000003/linux/debian/amd64/${APP_CHANNEL}"
+    # Clear the CloudFront cache for /linux/debian/debsig and /linux/debian/amd64
+    - aws cloudfront create-invalidation --distribution-id "${AWS_CLOUDFRONT_ID}" --paths "/linux/debian/debsig/*" "/linux/debian/amd64/*"
+  interruptible: false
+  environment:
+    name: publish-linux
+    action: prepare
+
+publish-linux-flatpak:
+  stage: publish
+  needs: ["package-linux-flatpak", "update-version-files"]
+  <<: *OPH_PUBLISH_RULES
+  <<: *LINUX_RUNNER_TAG
+  resource_group: publish-flatpak
+  script:
+    - *LINUX_APP_CHANNEL
+    - aws s3 sync --exclude "*" --include "1Password.flatpakref" --include "1Password-beta.flatpakref" js/oph/build_system/flatpak/ s3://downloads-1password-com20201013205912891100000003/linux/flatpak/
+    # see "Syncing updates" on https://blogs.gnome.org/alexl/2017/02/10/maintaining-a-flatpak-repository/
+    - aws s3 sync --exclude "summary*" --exclude "summaries" --exclude "summaries/*" "js/oph/scripts/flatpak_build_dir/repo/" "s3://downloads-1password-com20201013205912891100000003/linux/flatpak/repo"
+    - aws s3 sync "js/oph/scripts/flatpak_build_dir/repo/" "s3://downloads-1password-com20201013205912891100000003/linux/flatpak/repo"
+    # Clear the CloudFront cache for /linux/flatpak/repo
+    - aws cloudfront create-invalidation --distribution-id "${AWS_CLOUDFRONT_ID}" --paths "/linux/flatpak/repo"
+  interruptible: false
+  environment:
+    name: flatpak-publish
+    action: prepare
+
+publish-linux-rpm:
+  stage: publish
+  needs:
+    - job: linux-rpm-repo-x86
+    - job: sign-verify-linux-rpm
+      artifacts: false
+    - job: update-version-files
+  <<: *OPH_PUBLISH_AUTOMATIC_NIGHTLY_RULES
+  <<: *LINUX_RUNNER_TAG
+  resource_group: publish-linux-rpm
+  script:
+    # Cache Length:
+    # - versioned files for 1 year
+    # - unversioned and metadata for 1 day
+    - *LINUX_APP_CHANNEL
+    # RPMs
+    # we only build x86_64 right now
+    - aws s3 sync --cache-control "max-age=31536000,must-revalidate" --exclude "*" --include "1password-*.rpm" js/oph/dist "s3://downloads-1password-com20201013205912891100000003/linux/rpm/${APP_CHANNEL}/x86_64"
+    # dnf repo for RPMs
+    # we only build x86_64 right now
+    - aws s3 sync --cache-control "max-age=86400,must-revalidate" js/oph/dist/repodata "s3://downloads-1password-com20201013205912891100000003/linux/rpm/${APP_CHANNEL}/x86_64/repodata"
+    # Latest rpm
+    # we only build x86_64 right now
+    - cp js/oph/dist/1password-*.rpm js/oph/dist/1password-latest.rpm
+    - aws s3 sync --cache-control "max-age=86400,must-revalidate" --exclude "*" --include "1password-latest.rpm" js/oph/dist "s3://downloads-1password-com20201013205912891100000003/linux/rpm/${APP_CHANNEL}/x86_64"
+    # Clear the CloudFront cache for /linux/rpm/${APP_CHANNEL}/x86_64
+    - aws cloudfront create-invalidation --distribution-id "${AWS_CLOUDFRONT_ID}" --paths "/linux/rpm/${APP_CHANNEL}/x86_64/*"
+  interruptible: false
+  environment:
+    name: publish-linux
+    action: prepare
+
+publish-archlinux:
+  stage: publish
+  needs: ["sign-linux-x86", "update-version-files", "publish-linux-tar-x86"]
+  <<: *OPH_PUBLISH_RULES
+  # op-signer is required for archlinux for signing credentials
+  <<: *OP_SIGNER_TAG
+  resource_group: publish-archlinux
+  # The ArchLinux image is needed so files are generated correctly
+  image: ${CI_REGISTRY}/dev/core/1password-archlinux-aur-ci:latest
+  script:
+    - *LINUX_APP_CHANNEL
+    - export ARCH_CHANNEL=$APP_CHANNEL
+    # Generate the updates to PKGBUILD and .SRCINFO
+    - make -C js/oph dist/PKGBUILD dist/.SRCINFO
+    # CI runner instance profile has access to the secret
+    - unset AWS_ACCESS_KEY_ID
+    - unset AWS_SECRET_ACCESS_KEY
+    # Fetch the token used for gitlab cloning and api calls
+    - |
+      export ARCHLINUX_RELEASE_BOT_TOKEN=$(aws secretsmanager get-secret-value \
+        --region us-east-2 \
+        --secret-id 'arn:aws:secretsmanager:us-east-2:322190762435:secret:gitlab/1password.io/gldev/op_signer_arch_token' \
+        --output text \
+        --query SecretString)
+    # Import the gpg key for creating commits
+    - |
+      aws secretsmanager get-secret-value \
+        --region us-east-2 \
+        --secret-id 'arn:aws:secretsmanager:us-east-2:322190762435:secret:gitlab/1password.io/gldev/op_signer_arch_signing_key' \
+        --output text \
+        --query SecretString \
+      | gpg --batch --import
+    # Unlock the gpg key by signing a file in a known location
+    - |
+      aws secretsmanager get-secret-value \
+        --region us-east-2 \
+        --secret-id 'arn:aws:secretsmanager:us-east-2:322190762435:secret:gitlab/1password.io/gldev/op_signer_arch_pass' \
+        --output text \
+        --query SecretString \
+      | gpg --pinentry-mode loopback \
+        --passphrase-fd 0 \
+        --batch \
+        --detach-sign \
+        --output /dev/null \
+        /usr/bin/env
+    # Creates the MR on /dev/core/1password-archlinux-aur with the changes
+    - ./js/oph/scripts/generate_aur_merge_request.bash
+  interruptible: false
+  after_script:
+    - unset ARCHLINUX_RELEASE_BOT_TOKEN
+    - gpgconf --kill gpg-agent
+    - rm -rf ~/.gnupg
+  artifacts:
+    paths:
+      - js/oph/dist/.SRCINFO
+      - js/oph/dist/PKGBUILD
+      - js/oph/dist/SHA256SUMS
+
+publish-linux-snapcraft:
+  stage: publish
+  # snap is signed in this job
+  needs: ["package-linux-x86", "update-version-files", "archive-linux-snapcraft"]
+  <<: *OPH_PUBLISH_RULES
+  # op-signer is required for snapcraft and signing credentials
+  <<: *OP_SIGNER_TAG
+  resource_group: publish-linux-snapcraft
+  before_script:
+    # CI runner instance profile has access to the secret
+    - unset AWS_ACCESS_KEY_ID
+    - unset AWS_SECRET_ACCESS_KEY
+    # Login to snapcraft
+    - |
+      aws secretsmanager get-secret-value \
+        --region us-east-2 \
+        --secret-id 'arn:aws:secretsmanager:us-east-2:322190762435:secret:gitlab/1password.io/gldev/op_signer_snapcraft_login' \
+        --output text \
+        --query SecretString \
+      | snapcraft login --with -
+  script:
+    - *LINUX_APP_CHANNEL
+    # Upload to SnapCraft and release immediately upon validation. We allow failure
+    # on this line because snapcraft will return failure on a duplicate upload.
+    # sometimes the `snapcraft sign-build` command fails, and this job needs to be
+    # re-run
+    - snapcraft upload js/oph/dist/1password-*.snap --release "${APP_CHANNEL}" || true
+    # Import the gpg signing key for snapcraft
+    - mkdir -p ~/.snap/gnupg
+    - chmod 0600 ~/.snap/gnupg
+    - |
+      aws secretsmanager get-secret-value \
+        --region us-east-2 \
+        --secret-id 'arn:aws:secretsmanager:us-east-2:322190762435:secret:gitlab/1password.io/gldev/op_signer_snapcraft_key' \
+        --output text \
+        --query SecretString \
+      | base64 -d \
+      | gpg --homedir ~/.snap/gnupg --batch --import
+    # Unlock the gpg key by signing a file in a known location
+    - |
+      aws secretsmanager get-secret-value \
+        --region us-east-2 \
+        --secret-id 'arn:aws:secretsmanager:us-east-2:322190762435:secret:gitlab/1password.io/gldev/op_signer_snapcraft_key_pass' \
+        --output text \
+        --query SecretString \
+      | gpg --homedir ~/.snap/gnupg \
+        --pinentry-mode loopback \
+        --passphrase-fd 0 \
+        --batch \
+        --detach-sign \
+        --output /dev/null \
+        /usr/bin/env
+    # Sign and upload the build assertion to snapcraft, must be done after upload
+    - snapcraft sign-build js/oph/dist/1password-*.snap
+    - sha256sum -b js/oph/dist/1password-*.snap* | tee js/oph/dist/SHA256SUMS-snap
+  after_script:
+    - snapcraft logout
+    - rm -rf ~/.snap/gnupg
+  retry: 2
+  interruptible: false
+  artifacts:
+    when: always
+    paths:
+      - js/oph/dist/1password-*.snap
+      - js/oph/dist/1password-*.snap-build
+      - js/oph/dist/SHA256SUMS-snap
+
+publish-windows:
+  stage: publish
+  # virustotal-upload has `allow_failure: true`, so we will still be able to publish in the event
+  # we go over quota or their API is down. This could allow a nightly build to be released
+  # without being uploaded to Virus Total Monitor.
+  needs: ["sign-windows-installer-prod", "update-version-files", "virustotal-upload"]
+  <<: *OPH_PUBLISH_AUTOMATIC_NIGHTLY_RULES
+  <<: *LINUX_RUNNER_TAG
+  resource_group: publish-windows
+  script:
+    - mkdir -p ci-dist
+    - VERSION=$(cat foundation/op-sys-info/app.version-full)
+    - LATEST_NAME=$(cat foundation/op-sys-info/app.latest-name)
+    - cp js/oph/dist/win-unpacked/1Password.exe ci-dist/
+    - cp js/oph/dist/win-unpacked/1Password-BrowserSupport.exe ci-dist/
+    - curl https://cdn.agilebits.com/dist/1P/win8/CHANGELOG >> ci/changelog/opw/CHANGELOG
+    # Upload to cdn, update app-updates
+    - eval `ssh-agent -s`
+    - echo "$WIN8_SSH_CDN_DIST_PRIVATE_KEY" | tr -d '\r' | ssh-add - > /dev/null
+    - mkdir -p ~/.ssh && chmod 700 ~/.ssh
+    - echo "$B5X_SSH_CDN_KNOWN_HOSTS" > ~/.ssh/known_hosts && chmod 644 ~/.ssh/known_hosts
+    - scp -P2233 ci/changelog/opw/CHANGELOG ci-dist/1PasswordSetup-${VERSION}.exe ci-dist/1PasswordSetup-${LATEST_NAME}.exe dist-win8@cdn-publish.agilebits.com:/data2/dist/files/1P/win8/
+    - curl -s https://app-updates.agilebits.com/pull/OPW8
+    # Upload to downloads.1password.com
+    - aws s3 sync --exclude "*" --include "1PasswordSetup-${LATEST_NAME}.exe" --include "1PasswordSetup-${VERSION}.exe" ci-dist s3://downloads-1password-com20201013205912891100000003/win
+    - aws cloudfront create-invalidation --distribution-id "${AWS_CLOUDFRONT_ID}" --paths "/win/*"
+  artifacts:
+    when: always
+    expose_as: "signed-windows-installer"
+    paths:
+      - js/oph/dist/op-windows-starter.exe
+      - js/oph/dist/win-unpacked/1Password.exe
+      - js/oph/dist/win-unpacked/1Password-BrowserSupport.exe
+      - ci-dist
+      - ci/changelog/opw/CHANGELOG
+  interruptible: false
+  environment:
+    name: publish-opw
+    action: prepare
+
+publish-mlx:
+  stage: publish
+  dependencies:
+    - build-mlx
+  <<: *MLX_RELEASE_RULES
+  <<: *LINUX_RUNNER_TAG
+  script:
+    - make -C js/mlx publish
+  interruptible: false
+  environment:
+    name: publish-mlx
+    action: prepare
+
+publish-js_ui:
+  stage: publish
+  needs: ["build-js_ui"]
+  <<: *JS_UI_RELEASE_BUILD_RULES
+  <<: *LINUX_RUNNER_TAG
+  script:
+    - cd js/core-types
+    - npm config set //registry.npmjs.org/:_authToken $NPM_PUBLISH_TOKEN
+    - npm run npm-publish
+    - cd ../ui/dist
+    - npm run npm-publish
+  environment:
+    name: publish-npm
+    action: prepare
+
+publish-js_save-button:
+  stage: publish
+  <<: *JS_SAVE_BUTTON_RELEASE_RULES
+  <<: *LINUX_RUNNER_TAG
+  script:
+    - cd js/save-button
+    - npm config set //registry.npmjs.org/:_authToken $NPM_PUBLISH_TOKEN
+    - npm run npm-publish
+  interruptible: false
+  environment:
+    name: publish-npm
+    action: prepare
+
+workplace-annoucement:
+  stage: publish
+  needs: ["update-version-files"]
+  <<: *OPH_RELEASE_RULES
+  <<: *LINUX_RUNNER_TAG
+  script:
+    - ci/generate-workplace.bash | tee workplace-annoucement.txt
+  artifacts:
+    expose_as: "workplace-annoucement"
+    when: always
+    paths:
+      - workplace-annoucement.txt
+
+# Used for b5web's usage of core-wasm-web
+publish-js_core-wasm-web:
+  stage: publish
+  needs: ["build-js_core-wasm-web"]
+  <<: *JS_CORE_WASM_WEB_PUBLISH_RULES
+  <<: *LINUX_RUNNER_TAG
+  script:
+    - cd ffi/core-wasm-web
+    - npm config set //registry.npmjs.org/:_authToken $NPM_PUBLISH_TOKEN
+    - npm run npm-publish
+  interruptible: false
+  environment:
+    name: publish-npm
+    action: prepare
+
+publish-b5x-chrome-beta:
+  stage: publish
+  <<: *B5X_CHROME_BETA_VARIABLES
+  <<: *B5X_PUBLISH
+  <<: *B5X_BETA_PUBLISH_RULES
+  <<: *LINUX_RUNNER_TAG
+  interruptible: false
+  environment:
+    name: publish-b5x
+    action: prepare
+
+publish-b5x-firefox-beta:
+  stage: publish
+  <<: *B5X_FIREFOX_BETA_VARIABLES
+  <<: *B5X_PUBLISH
+  <<: *B5X_BETA_PUBLISH_RULES
+  <<: *LINUX_RUNNER_TAG
+  interruptible: false
+  environment:
+    name: publish-b5x
+    action: prepare
+
+publish-b5x-chrome-stable:
+  stage: publish
+  <<: *B5X_CHROME_STABLE_VARIABLES
+  <<: *B5X_PUBLISH
+  <<: *B5X_STABLE_PUBLISH_RULES
+  <<: *LINUX_RUNNER_TAG
+  interruptible: false
+  environment:
+    name: publish-b5x
+    action: prepare
+
+publish-b5x-changelog:
+  stage: publish
+  needs: []
+  <<: *LINUX_RUNNER_TAG
+  only:
+    - /^b5x\/release\/(beta|stable)\/.*$/
+    - /^b5x\/publish-changelog/
+  when: manual
+  except:
+    - triggers
+    - schedules
+  script:
+    - eval `ssh-agent -s`
+    - echo "$B5X_SSH_CDN_DIST_B5X_PRIVATE_KEY" | tr -d '\r' | ssh-add - > /dev/null
+    - mkdir -p ~/.ssh && chmod 700 ~/.ssh
+    - echo "$B5X_SSH_CDN_KNOWN_HOSTS" > ~/.ssh/known_hosts && chmod 644 ~/.ssh/known_hosts
+    - scp -P2233 js/b5x/changelogs/CHANGELOG dist-b5x@cdn-publish.agilebits.com:b5x/
+    - curl -s https://app-updates.agilebits.com/pull/B5X
+  interruptible: false
+  environment:
+    name: publish-b5x
+    action: prepare
+
+# Publishing of `opio` binaries.
+publish-opio_linux:
+  stage: publish
+  needs:
+    [
+      "sign-opio_linux_x64",
+      "sign-opio_linux_x86",
+      "sign-opio_linux_aarch64",
+      "sign-opio_linux_armv7",
+    ]
+  <<: *OPIO_PUBLISH_RULES
+  <<: *LINUX_RUNNER_TAG
+  interruptible: false
+  script:
+    # Syncs the binary releases and the signature files for each version.
+    - aws s3 sync --exclude "*" --include "opio_linux*" --include "opio_linux*.asc" ./ s3://downloads-1password-com20201013205912891100000003/opio/linux
+  environment:
+    name: publish-opio
+    action: prepare
+
+publish-opio_windows:
+  stage: publish
+  needs: ["sign-opio_windows_x64", "sign-opio_windows_x86"]
+  <<: *OPIO_PUBLISH_RULES
+  <<: *LINUX_RUNNER_TAG
+  interruptible: false
+  script:
+    - aws s3 sync --exclude "*" --include "opio_windows*.exe" ./ s3://downloads-1password-com20201013205912891100000003/opio/win
+  environment:
+    name: publish-opio
+    action: prepare
+
+publish-opio_macos:
+  stage: publish
+  needs: ["sign-opio_macos"]
+  <<: *OPIO_PUBLISH_RULES
+  <<: *LINUX_RUNNER_TAG
+  interruptible: false
+  script:
+    - aws s3 sync --exclude "*" --include "opio_macos*.pkg" ./ s3://downloads-1password-com20201013205912891100000003/opio/mac
+  environment:
+    name: publish-opio
+    action: prepare
+
+appcenter-opi-dsyms:
+  stage: publish
+  needs: ["package-iOS"]
+  <<: *OPH_RELEASE_RULES
+  <<: *LINUX_RUNNER_TAG
+  interruptible: false
+  script:
+    - npm install -g appcenter-cli
+    - appcenter crashes upload-symbols -s ios_artifacts/dSYMs.zip --app "Roustem-Karimov-Organization/1Password-8" --token "$OPI_APPCENTER_TOKEN" --disable-telemetry
+  allow_failure: true
+  environment:
+    name: appcenter
+    action: prepare
+
+###
+### Report generation
+###
+generate_core_dep-report:
+  stage: canary
+  <<: *LINUX_RUNNER_TAG
+  <<: *DEFAULT_RULES
+  needs: []
+  before_script:
+    - cargo install --path ./tools/dep-report --locked --features rust-report-creation
+  script:
+    - export REPORT_FILE_NAME=$(./ci/canary/report-name.bash)
+    - mkdir ./scan_reports
+    # Run in workspace mode, with the specified Cargo.toml being the Core workspace's.
+    - make js-bootstrap
+    - generate-dep-report -m workspace -f ./Cargo.toml -p core --node_modules .node_modules > ./scan_reports/$REPORT_FILE_NAME
+  artifacts:
+    when: always
+    paths:
+      - scan_reports/
+
+publish-dep-report:
+  stage: report
+  <<: *LINUX_RUNNER_TAG
+  <<: *DEP_REPORT_RULES
+  interruptible: false
+  needs:
+    - generate_core_dep-report
+  before_script: []
+  script:
+    # Add the needed S3 credentials
+    - export AWS_SECRET_ACCESS_KEY=$B5X_AWS_SECRET_ACCESS_KEY
+    - export AWS_ACCESS_KEY_ID=$B5X_AWS_ACCESS_KEY_ID
+    - aws s3 sync --exclude "*" --include "*.json" ./scan_reports/ s3://com-1password-platform-reports/dependency/core/
+  artifacts:
+    when: always
+    paths:
+      - scan_reports/
+  environment:
+    name: report
+    action: prepare
+
+###
+### Post
+###
+
+post-update-translations:
+  stage: .post
+  <<: *LINUX_RUNNER_TAG
+  rules:
+    - if: $CI_COMMIT_BRANCH == "main" && $CI_PIPELINE_SOURCE != "schedule"
+      changes:
+        - js/b5x/background/mv2/src/common/i18n/en/static-messages.json
+        - js/b5x/background/mv2/src/common/i18n/en/messages.json
+        - js/b5x/background/mv2/src/_locales/en/messages.json
+        - js/b5x/ui/inline/shared/i18n/en/static-messages.json
+        - js/b5x/ui/popup/src/shared/i18n/en/static-messages.json
+        - js/b5x/ui/popup/src/shared/i18n/en/messages.json
+  script:
+    - cd js/b5x && ./tools/upload-strings.rb
+  allow_failure: true
